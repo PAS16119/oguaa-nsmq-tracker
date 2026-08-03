@@ -208,6 +208,30 @@
   .bonus-arrow{font-size:11px; color:var(--muted); white-space:nowrap;}
   .subj-row{display:flex; justify-content:space-between; font-size:12px; padding:3px 0; color:var(--muted);}
   .subj-row .mono{color:var(--text);}
+  .grid-scroll{overflow-x:auto; -webkit-overflow-scrolling:touch; margin-bottom:4px;}
+  table.score-grid{border-collapse:collapse; font-size:12px;}
+  table.score-grid th, table.score-grid td{
+    border:1px solid var(--hair); padding:6px 5px; text-align:center; vertical-align:top; white-space:nowrap;
+  }
+  table.score-grid th{background:var(--panel-2); font-weight:600;}
+  .grid-q-label{font-size:10px; color:var(--muted); text-transform:uppercase; margin-bottom:3px;}
+  .grid-name-col{
+    text-align:left !important; min-width:110px; position:sticky; left:0;
+    background:var(--panel); z-index:2; font-weight:600;
+  }
+  th.grid-name-col{background:var(--panel-2); z-index:3;}
+  .mini-select{width:64px; font-size:11px; padding:3px 2px; margin:0 auto;}
+  .grid-cell-value{font-family:'IBM Plex Mono',monospace; font-weight:700; font-size:13px; margin-bottom:4px; color:var(--muted);}
+  .grid-cell-value.pos{color:var(--green);}
+  .grid-cell-value.neg{color:var(--red);}
+  .grid-toggle{display:flex; gap:3px; justify-content:center; margin-bottom:4px;}
+  .gbtn{
+    width:22px; height:22px; padding:0; font-size:11px; border-radius:4px;
+    border:1px solid var(--hair); background:var(--ink); color:var(--muted); cursor:pointer;
+  }
+  .gbtn.on-correct{background:var(--brass); color:var(--ink); border-color:var(--brass);}
+  .gbtn.on-wrong{background:var(--red); color:#fff; border-color:var(--red);}
+  .grid-total{font-weight:700; color:var(--brass-soft); background:var(--panel-2);}
   .print-only-name{display:none;}
 
   /* ---------- Standings ---------- */
@@ -490,26 +514,50 @@
     riddles:      { label:'Riddles', count:4, cluePoints:{1:5,2:4,3:3} }
   };
 
+  function makeGridSlots(m, count){
+    // Each slot = one subject-question-position, and EVERY contestant has their own
+    // turn at it (not one shared question). If a contestant's own turn is wrong,
+    // the bonus opens to the other contestants and is credited under that same slot.
+    return Array.from({length:count}, (_,i)=>{
+      const turns = {};
+      m.slots.forEach(cid=>{ turns[cid] = { mainResult:null, bonusCid:null, bonusResult:null }; });
+      return { subject: SUBJECTS[Math.floor(i/2)%4], turns };
+    });
+  }
+
   function initLiveScoring(m){
     if(m.live) return;
     m.live = {
-      fundamentals: Array.from({length:ROUND_INFO.fundamentals.count},(_,i)=>({subject:SUBJECTS[i%4], mainCid:null, mainResult:null, bonusCid:null, bonusResult:null})),
+      fundamentals: makeGridSlots(m, ROUND_INFO.fundamentals.count),
       speedRace: Array.from({length:ROUND_INFO.speedRace.count},(_,i)=>({subject:SUBJECTS[i%4], attempts:[null,null,null]})),
       potd: { subject:'Biology', scores:{} },
-      trueFalse: Array.from({length:ROUND_INFO.trueFalse.count},(_,i)=>({subject:SUBJECTS[i%4], mainCid:null, mainResult:null, bonusCid:null, bonusResult:null})),
+      trueFalse: makeGridSlots(m, ROUND_INFO.trueFalse.count),
       riddles: Array.from({length:ROUND_INFO.riddles.count},(_,i)=>({subject:SUBJECTS[i%4], winnerCid:null, clue:null})),
       skip: { potd:false }
     };
   }
 
+  // Scores a grid-style round (fundamentals or trueFalse) into totals.
+  function scoreGridRound(m, roundKey, totals){
+    const info = ROUND_INFO[roundKey];
+    (m.live[roundKey]||[]).forEach(slot=>{
+      Object.entries(slot.turns||{}).forEach(([cid, turn])=>{
+        if(totals[cid]===undefined) return;
+        if(turn.mainResult==='correct') totals[cid] += info.mainCorrect;
+        else if(turn.mainResult==='wrong' && info.mainWrong) totals[cid] += info.mainWrong;
+        if(turn.bonusCid && turn.bonusResult){
+          const pts = turn.bonusResult==='correct' ? info.bonusCorrect : info.bonusWrong;
+          if(totals[turn.bonusCid]===undefined) totals[turn.bonusCid]=0;
+          totals[turn.bonusCid] += pts;
+        }
+      });
+    });
+  }
+
   function computeLiveTotals(m, slots){
     const totals = {}; slots.forEach(cid=>totals[cid]=0);
     if(!m.live) return totals;
-    (m.live.fundamentals||[]).forEach(item=>{
-      if(item.mainCid && item.mainResult==='correct') totals[item.mainCid]+=ROUND_INFO.fundamentals.mainCorrect;
-      if(item.bonusCid && item.bonusResult==='correct') totals[item.bonusCid]+=ROUND_INFO.fundamentals.bonusCorrect;
-      if(item.bonusCid && item.bonusResult==='wrong') totals[item.bonusCid]+=ROUND_INFO.fundamentals.bonusWrong;
-    });
+    scoreGridRound(m, 'fundamentals', totals);
     (m.live.speedRace||[]).forEach(item=>{
       (item.attempts||[]).forEach((att,idx)=>{
         if(!att || !att.cid || !att.result) return;
@@ -522,12 +570,7 @@
         totals[cid] = (totals[cid]||0) + (parseFloat(score)||0);
       });
     }
-    (m.live.trueFalse||[]).forEach(item=>{
-      if(item.mainCid && item.mainResult==='correct') totals[item.mainCid]+=ROUND_INFO.trueFalse.mainCorrect;
-      if(item.mainCid && item.mainResult==='wrong') totals[item.mainCid]+=ROUND_INFO.trueFalse.mainWrong;
-      if(item.bonusCid && item.bonusResult==='correct') totals[item.bonusCid]+=ROUND_INFO.trueFalse.bonusCorrect;
-      if(item.bonusCid && item.bonusResult==='wrong') totals[item.bonusCid]+=ROUND_INFO.trueFalse.bonusWrong;
-    });
+    scoreGridRound(m, 'trueFalse', totals);
     (m.live.riddles||[]).forEach(item=>{
       if(item.winnerCid && item.clue){
         totals[item.winnerCid] += (ROUND_INFO.riddles.cluePoints[item.clue]||ROUND_INFO.riddles.cluePoints[3]);
@@ -1059,33 +1102,68 @@
     return html;
   }
 
+  function cellValueForGrid(slot, cid, info){
+    let val = 0;
+    const own = slot.turns[cid];
+    if(own){
+      if(own.mainResult==='correct') val += info.mainCorrect;
+      else if(own.mainResult==='wrong') val += info.mainWrong;
+    }
+    Object.entries(slot.turns).forEach(([ownerCid, turn])=>{
+      if(ownerCid!==cid && turn.bonusCid===cid && turn.bonusResult){
+        val += turn.bonusResult==='correct' ? info.bonusCorrect : info.bonusWrong;
+      }
+    });
+    return val;
+  }
+
   function renderMainBonusRound(m, mi, roundKey, names, slots){
     const info = ROUND_INFO[roundKey];
+    const items = m.live[roundKey];
     let html = `<div class="round-block">
-      <div class="round-head">${info.label} <span class="pill">correct +${info.mainCorrect} · wrong ${info.mainWrong} · bonus +${info.bonusCorrect}/${info.bonusWrong}</span></div>`;
-    m.live[roundKey].forEach((item, idx)=>{
-      html += `<div class="round-item">
-        <select data-live-subject="${mi}|${roundKey}|${idx}">
-          ${SUBJECTS.map(s=>`<option value="${s}" ${item.subject===s?'selected':''}>${s}</option>`).join('')}
-        </select>
-        <select data-live-main-cid="${mi}|${roundKey}|${idx}">
-          <option value="">Main…</option>
-          ${slots.map(cid=>`<option value="${cid}" ${item.mainCid===cid?'selected':''}>${escapeHtml(names[cid])}</option>`).join('')}
-        </select>
-        <button type="button" class="btn btn-sm ${item.mainResult==='correct'?'btn-brass':''}" data-live-main-result="${mi}|${roundKey}|${idx}|correct" ${!item.mainCid?'disabled':''}>✓</button>
-        <button type="button" class="btn btn-sm ${item.mainResult==='wrong'?'btn-danger':''}" data-live-main-result="${mi}|${roundKey}|${idx}|wrong" ${!item.mainCid?'disabled':''}>✗</button>
-        ${item.mainResult==='wrong' ? `
-          <span class="bonus-arrow">→ bonus</span>
-          <select data-live-bonus-cid="${mi}|${roundKey}|${idx}">
-            <option value="">Bonus…</option>
-            ${slots.filter(cid=>cid!==item.mainCid).map(cid=>`<option value="${cid}" ${item.bonusCid===cid?'selected':''}>${escapeHtml(names[cid])}</option>`).join('')}
-          </select>
-          <button type="button" class="btn btn-sm ${item.bonusResult==='correct'?'btn-brass':''}" data-live-bonus-result="${mi}|${roundKey}|${idx}|correct" ${!item.bonusCid?'disabled':''}>✓</button>
-          <button type="button" class="btn btn-sm ${item.bonusResult==='wrong'?'btn-danger':''}" data-live-bonus-result="${mi}|${roundKey}|${idx}|wrong" ${!item.bonusCid?'disabled':''}>✗</button>
-        `:''}
-      </div>`;
+      <div class="round-head">${info.label} <span class="pill">correct +${info.mainCorrect} · wrong ${info.mainWrong} · bonus +${info.bonusCorrect}/${info.bonusWrong}</span></div>
+      <div class="small-note" style="margin-bottom:8px;">Each contestant has their own question at every slot — tap the subject if the order isn't fixed, mark ✓/✗, and a bonus opens automatically to the other two if wrong.</div>
+      <div class="grid-scroll">
+      <table class="score-grid">
+        <thead><tr>
+          <th class="grid-name-col">Contestant</th>
+          ${items.map((slot,idx)=>`<th>
+            <div class="grid-q-label">Q${idx+1}</div>
+            <select class="mini-select" data-live-subject="${mi}|${roundKey}|${idx}">
+              ${SUBJECTS.map(s=>`<option value="${s}" ${slot.subject===s?'selected':''}>${s.slice(0,4)}</option>`).join('')}
+            </select>
+          </th>`).join('')}
+          <th>Total</th>
+        </tr></thead>
+        <tbody>`;
+    slots.forEach(cid=>{
+      let rowTotal = 0;
+      let cells = '';
+      items.forEach((slot, idx)=>{
+        const own = slot.turns[cid] || {mainResult:null,bonusCid:null,bonusResult:null};
+        const cellVal = cellValueForGrid(slot, cid, info);
+        rowTotal += cellVal;
+        cells += `<td class="grid-cell">
+          <div class="grid-cell-value ${cellVal>0?'pos':cellVal<0?'neg':''}">${cellVal}</div>
+          <div class="grid-toggle">
+            <button type="button" class="gbtn ${own.mainResult==='correct'?'on-correct':''}" data-live-main-result="${mi}|${roundKey}|${idx}|${cid}|correct">✓</button>
+            <button type="button" class="gbtn ${own.mainResult==='wrong'?'on-wrong':''}" data-live-main-result="${mi}|${roundKey}|${idx}|${cid}|wrong">✗</button>
+          </div>
+          ${own.mainResult==='wrong' ? `
+            <select class="mini-select" data-live-bonus-cid="${mi}|${roundKey}|${idx}|${cid}">
+              <option value="">Bonus…</option>
+              ${slots.filter(oc=>oc!==cid).map(oc=>`<option value="${oc}" ${own.bonusCid===oc?'selected':''}>${escapeHtml(names[oc]).slice(0,8)}</option>`).join('')}
+            </select>
+            <div class="grid-toggle">
+              <button type="button" class="gbtn ${own.bonusResult==='correct'?'on-correct':''}" data-live-bonus-result="${mi}|${roundKey}|${idx}|${cid}|correct" ${!own.bonusCid?'disabled':''}>✓</button>
+              <button type="button" class="gbtn ${own.bonusResult==='wrong'?'on-wrong':''}" data-live-bonus-result="${mi}|${roundKey}|${idx}|${cid}|wrong" ${!own.bonusCid?'disabled':''}>✗</button>
+            </div>
+          `:''}
+        </td>`;
+      });
+      html += `<tr><td class="grid-name-col">${escapeHtml(names[cid])}</td>${cells}<td class="mono grid-total">${rowTotal}</td></tr>`;
     });
-    html += `</div>`;
+    html += `</tbody></table></div></div>`;
     return html;
   }
 
@@ -1454,16 +1532,22 @@
               if(isCorrect===false) rb.wrong++;
             });
           }
-          (m.live.fundamentals||[]).forEach(item=>{
-            if(item.mainCid && item.mainResult){
-              const pts = item.mainResult==='correct'?ROUND_INFO.fundamentals.mainCorrect:ROUND_INFO.fundamentals.mainWrong;
-              credit(item.mainCid, item.subject, pts, item.mainResult==='correct', 'fundamentals');
-            }
-            if(item.bonusCid && item.bonusResult){
-              const pts = item.bonusResult==='correct'?ROUND_INFO.fundamentals.bonusCorrect:ROUND_INFO.fundamentals.bonusWrong;
-              credit(item.bonusCid, item.subject, pts, item.bonusResult==='correct', 'fundamentals');
-            }
-          });
+          function creditGridRound(roundKey){
+            const info = ROUND_INFO[roundKey];
+            (m.live[roundKey]||[]).forEach(slot=>{
+              Object.entries(slot.turns||{}).forEach(([cid, turn])=>{
+                if(turn.mainResult){
+                  const pts = turn.mainResult==='correct' ? info.mainCorrect : info.mainWrong;
+                  credit(cid, slot.subject, pts, turn.mainResult==='correct', roundKey);
+                }
+                if(turn.bonusCid && turn.bonusResult){
+                  const pts = turn.bonusResult==='correct' ? info.bonusCorrect : info.bonusWrong;
+                  credit(turn.bonusCid, slot.subject, pts, turn.bonusResult==='correct', roundKey);
+                }
+              });
+            });
+          }
+          creditGridRound('fundamentals');
           (m.live.speedRace||[]).forEach(item=>{
             (item.attempts||[]).forEach((att,idx)=>{
               if(!att || !att.cid || !att.result) return;
@@ -1477,16 +1561,7 @@
               credit(cid, m.live.potd.subject, parseFloat(score)||0, null, 'potd');
             });
           }
-          (m.live.trueFalse||[]).forEach(item=>{
-            if(item.mainCid && item.mainResult){
-              const pts = item.mainResult==='correct'?ROUND_INFO.trueFalse.mainCorrect:ROUND_INFO.trueFalse.mainWrong;
-              credit(item.mainCid, item.subject, pts, item.mainResult==='correct', 'trueFalse');
-            }
-            if(item.bonusCid && item.bonusResult){
-              const pts = item.bonusResult==='correct'?ROUND_INFO.trueFalse.bonusCorrect:ROUND_INFO.trueFalse.bonusWrong;
-              credit(item.bonusCid, item.subject, pts, item.bonusResult==='correct', 'trueFalse');
-            }
-          });
+          creditGridRound('trueFalse');
           (m.live.riddles||[]).forEach(item=>{
             if(item.winnerCid && item.clue){
               const pts = ROUND_INFO.riddles.cluePoints[item.clue]||ROUND_INFO.riddles.cluePoints[3];
@@ -1846,34 +1921,26 @@
       m.live[roundKey][parseInt(idx)].subject = e.target.value;
       saveCurrentTournament(); render();
     }));
-    qa('[data-live-main-cid]').forEach(el=>el.addEventListener('change', e=>{
-      const [mi, roundKey, idx] = el.getAttribute('data-live-main-cid').split('|');
-      const m = currentTournament.stages[currentTournament.currentStageIndex].matches[parseInt(mi)];
-      const item = m.live[roundKey][parseInt(idx)];
-      item.mainCid = e.target.value || null;
-      item.mainResult = null; item.bonusCid = null; item.bonusResult = null;
-      saveCurrentTournament(); render();
-    }));
     qa('[data-live-main-result]').forEach(el=>el.addEventListener('click', ()=>{
-      const [mi, roundKey, idx, result] = el.getAttribute('data-live-main-result').split('|');
+      const [mi, roundKey, idx, cid, result] = el.getAttribute('data-live-main-result').split('|');
       const m = currentTournament.stages[currentTournament.currentStageIndex].matches[parseInt(mi)];
-      const item = m.live[roundKey][parseInt(idx)];
-      item.mainResult = result;
-      if(result==='correct'){ item.bonusCid=null; item.bonusResult=null; }
+      const turn = m.live[roundKey][parseInt(idx)].turns[cid];
+      turn.mainResult = result;
+      if(result==='correct'){ turn.bonusCid=null; turn.bonusResult=null; }
       saveCurrentTournament(); render();
     }));
     qa('[data-live-bonus-cid]').forEach(el=>el.addEventListener('change', e=>{
-      const [mi, roundKey, idx] = el.getAttribute('data-live-bonus-cid').split('|');
+      const [mi, roundKey, idx, cid] = el.getAttribute('data-live-bonus-cid').split('|');
       const m = currentTournament.stages[currentTournament.currentStageIndex].matches[parseInt(mi)];
-      const item = m.live[roundKey][parseInt(idx)];
-      item.bonusCid = e.target.value || null;
-      item.bonusResult = null;
+      const turn = m.live[roundKey][parseInt(idx)].turns[cid];
+      turn.bonusCid = e.target.value || null;
+      turn.bonusResult = null;
       saveCurrentTournament(); render();
     }));
     qa('[data-live-bonus-result]').forEach(el=>el.addEventListener('click', ()=>{
-      const [mi, roundKey, idx, result] = el.getAttribute('data-live-bonus-result').split('|');
+      const [mi, roundKey, idx, cid, result] = el.getAttribute('data-live-bonus-result').split('|');
       const m = currentTournament.stages[currentTournament.currentStageIndex].matches[parseInt(mi)];
-      m.live[roundKey][parseInt(idx)].bonusResult = result;
+      m.live[roundKey][parseInt(idx)].turns[cid].bonusResult = result;
       saveCurrentTournament(); render();
     }));
 
