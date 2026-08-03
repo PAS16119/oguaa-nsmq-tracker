@@ -184,6 +184,30 @@
   .m-player-row select, .m-player-row input{width:auto; min-width:88px;}
   .m-player-row .score-input{width:70px;}
   .completed-tag{color:var(--green); font-size:11px; font-weight:700; text-transform:uppercase;}
+  .live-scorer{border-top:1px dashed var(--hair); margin-top:12px; padding-top:12px;}
+  .live-totals{display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px;}
+  .live-total-chip{
+    background:var(--panel-2); border:1px solid var(--brass); border-radius:8px;
+    padding:8px 12px; display:flex; flex-direction:column; gap:2px; min-width:90px;
+  }
+  .live-total-chip span:first-child{font-size:11px; color:var(--muted);}
+  .live-total-chip span:last-child{font-family:'IBM Plex Mono',monospace; font-size:18px; color:var(--brass-soft); font-weight:600;}
+  .round-block{margin-bottom:16px;}
+  .round-head{
+    font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:0.4px;
+    color:var(--brass-soft); margin-bottom:8px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+  }
+  .round-head .pill{font-size:10px; text-transform:none; letter-spacing:0;}
+  .round-item{
+    display:flex; align-items:center; gap:6px; flex-wrap:wrap;
+    background:var(--ink); border:1px solid var(--hair); border-radius:7px;
+    padding:7px 9px; margin-bottom:6px; font-size:13px;
+  }
+  .round-item select{width:auto; min-width:80px; padding:6px 8px; font-size:12px;}
+  .attempt-slot{display:inline-flex; align-items:center; gap:4px; background:var(--panel-2); border-radius:6px; padding:3px 5px;}
+  .bonus-arrow{font-size:11px; color:var(--muted); white-space:nowrap;}
+  .subj-row{display:flex; justify-content:space-between; font-size:12px; padding:3px 0; color:var(--muted);}
+  .subj-row .mono{color:var(--text);}
   .print-only-name{display:none;}
 
   /* ---------- Standings ---------- */
@@ -331,7 +355,7 @@
   }
 
   /* ============================= APP STATE ============================= */
-  let DB = { roster: [], tIndex: [], coachPin: null };   // tIndex: [{id,name,createdAt,matchFormat,status,stageLabel}]
+  let DB = { roster: [], tIndex: [], coachPin: null, meetings: [], assessments: [], weights: {attendance:30, assessment:30, quiz:40} };
   let currentTournament = null;          // full loaded tournament object
   let ui = {
     view:'home',            // home | new | tournament | profiles
@@ -342,7 +366,12 @@
     pinModal:null,          // {mode:'setup'|'unlock', value:'', error:''}
     qualifySelection:null,  // array of cids currently ticked to advance
     qualifySelectionStage:null, // which stage.key the selection belongs to
-    editingNameCid:null     // competitor id currently being renamed
+    editingNameCid:null,    // competitor id currently being renamed
+    viewingStageIdx:null,   // which stage index is currently being viewed (may differ from live stage)
+    openLiveScorerKey:null, // "stageIdx|matchIndex" of the match currently expanded for live scoring
+    expandedProfile:null,   // name of student whose contest-analysis panel is expanded
+    expandedMeeting:null,   // meeting id currently expanded for attendance entry
+    expandedAssessment:null // assessment id currently expanded for score entry
   };
 
   function uid(prefix){ return prefix+'_'+Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
@@ -448,6 +477,87 @@
   /* ============================= SCORING ============================= */
   const POINTS = {1:3, 2:2, 3:1};
 
+  // Given {cid: score}, ranks contestants by score (highest first).
+  // Ties split the points of the positions they occupy evenly, e.g.
+  // two people tied for 1st each get (3+2)/2 = 2.5 points.
+  /* ============================= NSMQ LIVE ROUND SCORING ============================= */
+  const SUBJECTS = ['Biology','Physics','Chemistry','Mathematics'];
+  const ROUND_INFO = {
+    fundamentals: { label:'Fundamentals', count:8,  mainCorrect:3, mainWrong:0,  bonusCorrect:1, bonusWrong:-1 },
+    speedRace:    { label:'Speed Race',   count:12, ladder:[3,2,1], wrong:-1 },
+    potd:         { label:'Problem of the Day', max:10 },
+    trueFalse:    { label:'True/False',   count:8,  mainCorrect:2, mainWrong:-1, bonusCorrect:2, bonusWrong:-1 },
+    riddles:      { label:'Riddles', count:4, cluePoints:{1:5,2:4,3:3} }
+  };
+
+  function initLiveScoring(m){
+    if(m.live) return;
+    m.live = {
+      fundamentals: Array.from({length:ROUND_INFO.fundamentals.count},(_,i)=>({subject:SUBJECTS[i%4], mainCid:null, mainResult:null, bonusCid:null, bonusResult:null})),
+      speedRace: Array.from({length:ROUND_INFO.speedRace.count},(_,i)=>({subject:SUBJECTS[i%4], attempts:[null,null,null]})),
+      potd: { subject:'Biology', scores:{} },
+      trueFalse: Array.from({length:ROUND_INFO.trueFalse.count},(_,i)=>({subject:SUBJECTS[i%4], mainCid:null, mainResult:null, bonusCid:null, bonusResult:null})),
+      riddles: Array.from({length:ROUND_INFO.riddles.count},(_,i)=>({subject:SUBJECTS[i%4], winnerCid:null, clue:null})),
+      skip: { potd:false }
+    };
+  }
+
+  function computeLiveTotals(m, slots){
+    const totals = {}; slots.forEach(cid=>totals[cid]=0);
+    if(!m.live) return totals;
+    (m.live.fundamentals||[]).forEach(item=>{
+      if(item.mainCid && item.mainResult==='correct') totals[item.mainCid]+=ROUND_INFO.fundamentals.mainCorrect;
+      if(item.bonusCid && item.bonusResult==='correct') totals[item.bonusCid]+=ROUND_INFO.fundamentals.bonusCorrect;
+      if(item.bonusCid && item.bonusResult==='wrong') totals[item.bonusCid]+=ROUND_INFO.fundamentals.bonusWrong;
+    });
+    (m.live.speedRace||[]).forEach(item=>{
+      (item.attempts||[]).forEach((att,idx)=>{
+        if(!att || !att.cid || !att.result) return;
+        const pts = ROUND_INFO.speedRace.ladder[idx]!==undefined?ROUND_INFO.speedRace.ladder[idx]:1;
+        totals[att.cid] += (att.result==='correct') ? pts : ROUND_INFO.speedRace.wrong;
+      });
+    });
+    if(m.live.potd && !(m.live.skip && m.live.skip.potd)){
+      Object.entries(m.live.potd.scores||{}).forEach(([cid,score])=>{
+        totals[cid] = (totals[cid]||0) + (parseFloat(score)||0);
+      });
+    }
+    (m.live.trueFalse||[]).forEach(item=>{
+      if(item.mainCid && item.mainResult==='correct') totals[item.mainCid]+=ROUND_INFO.trueFalse.mainCorrect;
+      if(item.mainCid && item.mainResult==='wrong') totals[item.mainCid]+=ROUND_INFO.trueFalse.mainWrong;
+      if(item.bonusCid && item.bonusResult==='correct') totals[item.bonusCid]+=ROUND_INFO.trueFalse.bonusCorrect;
+      if(item.bonusCid && item.bonusResult==='wrong') totals[item.bonusCid]+=ROUND_INFO.trueFalse.bonusWrong;
+    });
+    (m.live.riddles||[]).forEach(item=>{
+      if(item.winnerCid && item.clue){
+        totals[item.winnerCid] += (ROUND_INFO.riddles.cluePoints[item.clue]||ROUND_INFO.riddles.cluePoints[3]);
+      }
+    });
+    return totals;
+  }
+
+  function computeRanksFromScores(scoresObj){
+    const entries = Object.entries(scoresObj);
+    entries.sort((a,b)=> b[1]-a[1]);
+    const n = entries.length;
+    const results = {};
+    let i = 0;
+    while(i<n){
+      let j = i;
+      while(j+1<n && entries[j+1][1]===entries[i][1]) j++;
+      const posPoints = [];
+      for(let k=i;k<=j;k++) posPoints.push(POINTS[k+1]!==undefined?POINTS[k+1]:0);
+      const avgPoints = posPoints.reduce((a,b)=>a+b,0)/posPoints.length;
+      const tied = j>i;
+      for(let k=i;k<=j;k++){
+        const cid = entries[k][0];
+        results[cid] = { rank:i+1, score:entries[k][1], points:avgPoints, tied };
+      }
+      i = j+1;
+    }
+    return results;
+  }
+
   function competitorName(t, cid){
     const c = (t.competitors||[]).find(x=>x.id===cid);
     return c ? c.name : '(unknown)';
@@ -466,7 +576,8 @@
         const r = m.results && m.results[cid];
         if(!r || !stats[cid]) return;
         stats[cid].played++;
-        stats[cid].pts += POINTS[r.rank]||0;
+        // supports both new (fractional points, tie-aware) and any older (integer-rank-only) saved results
+        stats[cid].pts += (typeof r.points==='number') ? r.points : (POINTS[r.rank]||0);
         stats[cid].score += (r.score||0);
         stats[cid].ranks.push(r.rank);
         if(r.rank===1) stats[cid].firsts++;
@@ -510,6 +621,7 @@
     else if(ui.view==='new') html += renderNewTournament();
     else if(ui.view==='tournament') html += renderTournament();
     else if(ui.view==='profiles') html += renderProfiles();
+    else if(ui.view==='squad') html += renderSquad();
     html += '</main>';
     if(ui.confirmModal) html += renderModal(ui.confirmModal);
     if(ui.pinModal) html += renderPinModal();
@@ -530,6 +642,7 @@
       <nav class="tabs">
         <button data-nav="home" class="${ui.view==='home'||ui.view==='new'||ui.view==='tournament'?'active':''}">Tournaments</button>
         <button data-nav="profiles" class="${ui.view==='profiles'?'active':''}">Student Profiles</button>
+        <button data-nav="squad" class="${ui.view==='squad'?'active':''}">Squad</button>
         ${renderCoachLockButton()}
       </nav>
     </header>`;
@@ -721,8 +834,10 @@
   function renderTournament(){
     if(!currentTournament) return `<div class="empty">Loading…</div>`;
     const t = currentTournament;
-    const stageIdx = t.currentStageIndex;
+    if(ui.viewingStageIdx==null || ui.viewingStageIdx>=t.stages.length) ui.viewingStageIdx = t.currentStageIndex;
+    const stageIdx = ui.viewingStageIdx;
     const stage = t.stages[stageIdx];
+    const isCurrent = stageIdx === t.currentStageIndex;
 
     let html = `<a class="link-btn" data-nav="home">← All tournaments</a>
       <div class="flex-between" style="margin:14px 0 6px;">
@@ -732,13 +847,21 @@
 
     html += `<div class="stepper">`;
     t.stages.forEach((s,i)=>{
-      const cls = i===stageIdx?'active':(i<stageIdx?'done':'');
-      html += `<div class="step ${cls}"><span class="step-dot"></span>${escapeHtml(s.label)}</div>`;
+      const cls = [];
+      if(i===stageIdx) cls.push('active');
+      if(i<t.currentStageIndex) cls.push('done');
+      html += `<div class="step ${cls.join(' ')}" data-view-stage="${i}" style="cursor:pointer;">
+        <span class="step-dot"></span>${escapeHtml(s.label)}${(i===t.currentStageIndex && i!==stageIdx)?' <span class="pill gold" style="margin-left:4px;">live</span>':''}
+      </div>`;
       if(i<t.stages.length-1) html += `<div class="step-sep"></div>`;
     });
     html += `</div>`;
 
-    if(ui.isCoach && t.stages.length>1 && !t.champion){
+    if(!isCurrent){
+      html += `<div class="ok-box">Viewing "${escapeHtml(stage.label)}" (completed) — read-only. Tap "${escapeHtml(t.stages[t.currentStageIndex].label)}" above to get back to the live stage.</div>`;
+    }
+
+    if(ui.isCoach && isCurrent && t.stages.length>1 && !t.champion){
       html += `<div style="margin-bottom:14px;"><a class="link-btn" data-undo-advance="1">← Undo advance, go back to "${escapeHtml(t.stages[stageIdx-1].label)}"</a></div>`;
     }
 
@@ -750,11 +873,12 @@
       </div>`;
     }
 
-    html += renderStagePanel(t, stage, stageIdx);
+    html += renderStagePanel(t, stage, stageIdx, isCurrent);
     return html;
   }
 
-  function renderStagePanel(t, stage, stageIdx){
+  function renderStagePanel(t, stage, stageIdx, isCurrent){
+    const canEdit = ui.isCoach && isCurrent;
     let html = `<div class="card">
       <div class="flex-between">
         <div>
@@ -766,7 +890,7 @@
     if(!stage.matches || stage.matches.length===0){
       // Fixture not generated yet
       html += `<div class="divider"></div>`;
-      if(!ui.isCoach){
+      if(!canEdit){
         html += `<p class="small-note">Fixture hasn't been generated yet — check back once your coach sets it up.</p>`;
       } else {
         if(stageIdx===0) html += renderCompetitorEditPanel(t, stage);
@@ -785,7 +909,7 @@
         }
       }
     } else {
-      if(ui.isCoach){
+      if(canEdit){
         const anyCompleted = stage.matches.some(m=>m.completed);
         html += `<div class="divider"></div>
           <button class="btn btn-sm btn-ghost" data-reset-fixture="${stageIdx}">↺ ${anyCompleted?'Reset fixture (clears recorded results)':'Regenerate fixture'}</button>`;
@@ -799,11 +923,11 @@
       let matchCounter = 0;
       stage.matches.forEach((m)=>{
         matchCounter++;
-        html += renderMatchTicket(t, stage, stageIdx, m, matchCounter);
+        html += renderMatchTicket(t, stage, stageIdx, m, matchCounter, canEdit);
       });
 
       html += `<div class="divider"></div><h3 class="display" style="font-size:15px;margin:0 0 10px;">Standings</h3>`;
-      html += renderStandingsTable(t, stage, stageIdx);
+      html += renderStandingsTable(t, stage, stageIdx, canEdit);
     }
 
     html += `</div>`;
@@ -871,49 +995,183 @@
     return html;
   }
 
-  function renderMatchTicket(t, stage, stageIdx, m, num){
+  function renderMatchTicket(t, stage, stageIdx, m, num, canEdit){
+    const mi = stage.matches.indexOf(m);
+    const key = stageIdx+'|'+mi;
+    const isOpen = ui.openLiveScorerKey === key;
+    const rankLabel = {1:'1st',2:'2nd',3:'3rd'};
+
     let html = `<div class="match-ticket">
       <div class="m-head">
         <span class="m-label">Match ${num}${m.completed?' · <span class="completed-tag">Recorded</span>':''}</span>
+        ${canEdit ? `<button type="button" class="btn btn-sm ${isOpen?'btn-brass':'btn-ghost'} no-print" data-toggle-live-scorer="${key}">${isOpen?'▾ Hide scorer':'▸ '+(m.completed?'Edit score':'Score live')}</button>` : ''}
       </div>
       <div class="m-players">`;
-    const rankLabel = {1:'1st',2:'2nd',3:'3rd'};
+
     m.slots.forEach((cid, slotIdx)=>{
       const isSeed = (t.competitors.find(c=>c.id===cid)||{}).seed;
-      const result = m.results && m.results[cid] ? m.results[cid] : {rank:'', score:''};
-      if(ui.isCoach){
+      const result = m.results && m.results[cid] ? m.results[cid] : null;
+      const rankText = result && result.rank ? (result.tied?'T-':'')+rankLabel[result.rank] : '';
+      if(canEdit && !m.completed){
         html += `<div class="m-player-row">
-          <span class="print-only-name">${escapeHtml(competitorName(t,cid))}${isSeed?' ★':''}${result.rank?' — '+rankLabel[result.rank]+(result.score!==undefined&&result.score!==''?' ('+result.score+')':''):''}</span>
-          <select data-slot-edit="${stage.matches.indexOf(m)}|${slotIdx}" ${m.completed?'disabled':''}>
+          <span class="print-only-name">${escapeHtml(competitorName(t,cid))}${isSeed?' ★':''}</span>
+          <select data-slot-edit="${mi}|${slotIdx}">
             ${stage.competitorIds.map(oc=>`<option value="${oc}" ${oc===cid?'selected':''}>${escapeHtml(competitorName(t,oc))}</option>`).join('')}
           </select>
-          <select data-rank-input="${stage.matches.indexOf(m)}|${cid}">
-            <option value="">Rank…</option>
-            <option value="1" ${result.rank==1?'selected':''}>1st</option>
-            <option value="2" ${result.rank==2?'selected':''}>2nd</option>
-            <option value="3" ${result.rank==3?'selected':''}>3rd</option>
-          </select>
-          <input type="number" class="score-input" placeholder="Score" data-score-input="${stage.matches.indexOf(m)}|${cid}" value="${result.score!==undefined && result.score!==''?result.score:''}">
+          <span class="pill">Pending</span>
         </div>`;
       } else {
         html += `<div class="m-player-row">
           <span class="name">${escapeHtml(competitorName(t,cid))}${isSeed?'<span class="seed-star">★</span>':''}</span>
-          ${m.completed ? `<span class="pill gold">${rankLabel[result.rank]||''}${result.score!==undefined&&result.score!==''?' · '+result.score:''}</span>` : `<span class="pill">Pending</span>`}
+          ${m.completed ? `<span class="pill gold">${rankText}${result&&result.score!==undefined?' · '+result.score+' pts':''}</span>` : `<span class="pill">Pending</span>`}
         </div>`;
       }
     });
     html += `</div>`;
-    if(ui.isCoach){
-      html += `<div style="margin-top:10px; display:flex; gap:8px;">
-        <button class="btn btn-sm btn-brass" data-save-match="${stage.matches.indexOf(m)}">Save result</button>
-        ${m.completed?`<button class="btn btn-sm btn-ghost" data-edit-match="${stage.matches.indexOf(m)}">Edit</button>`:''}
-      </div>`;
+
+    if(isOpen){
+      html += renderLiveScorer(t, m, mi);
     }
     html += `</div>`;
     return html;
   }
 
-  function renderStandingsTable(t, stage, stageIdx){
+  function renderLiveScorer(t, m, mi){
+    initLiveScoring(m);
+    const names = {}; m.slots.forEach(cid=>names[cid]=competitorName(t,cid));
+    const totals = computeLiveTotals(m, m.slots);
+
+    let html = `<div class="live-scorer no-print">
+      <div class="live-totals">`;
+    m.slots.forEach(cid=>{
+      html += `<div class="live-total-chip"><span>${escapeHtml(names[cid])}</span><span class="mono">${totals[cid]}</span></div>`;
+    });
+    html += `</div>`;
+
+    html += renderMainBonusRound(m, mi, 'fundamentals', names, m.slots);
+    html += renderSpeedRaceRound(m, mi, names, m.slots);
+    html += renderPotdRound(m, mi, names, m.slots);
+    html += renderMainBonusRound(m, mi, 'trueFalse', names, m.slots);
+    html += renderRiddlesRound(m, mi, names, m.slots);
+
+    html += `<div style="margin-top:14px;"><button class="btn btn-brass" data-finish-live-match="${mi}">✓ Finish match &amp; save score</button></div>`;
+    html += `</div>`;
+    return html;
+  }
+
+  function renderMainBonusRound(m, mi, roundKey, names, slots){
+    const info = ROUND_INFO[roundKey];
+    let html = `<div class="round-block">
+      <div class="round-head">${info.label} <span class="pill">correct +${info.mainCorrect} · wrong ${info.mainWrong} · bonus +${info.bonusCorrect}/${info.bonusWrong}</span></div>`;
+    m.live[roundKey].forEach((item, idx)=>{
+      html += `<div class="round-item">
+        <select data-live-subject="${mi}|${roundKey}|${idx}">
+          ${SUBJECTS.map(s=>`<option value="${s}" ${item.subject===s?'selected':''}>${s}</option>`).join('')}
+        </select>
+        <select data-live-main-cid="${mi}|${roundKey}|${idx}">
+          <option value="">Main…</option>
+          ${slots.map(cid=>`<option value="${cid}" ${item.mainCid===cid?'selected':''}>${escapeHtml(names[cid])}</option>`).join('')}
+        </select>
+        <button type="button" class="btn btn-sm ${item.mainResult==='correct'?'btn-brass':''}" data-live-main-result="${mi}|${roundKey}|${idx}|correct" ${!item.mainCid?'disabled':''}>✓</button>
+        <button type="button" class="btn btn-sm ${item.mainResult==='wrong'?'btn-danger':''}" data-live-main-result="${mi}|${roundKey}|${idx}|wrong" ${!item.mainCid?'disabled':''}>✗</button>
+        ${item.mainResult==='wrong' ? `
+          <span class="bonus-arrow">→ bonus</span>
+          <select data-live-bonus-cid="${mi}|${roundKey}|${idx}">
+            <option value="">Bonus…</option>
+            ${slots.filter(cid=>cid!==item.mainCid).map(cid=>`<option value="${cid}" ${item.bonusCid===cid?'selected':''}>${escapeHtml(names[cid])}</option>`).join('')}
+          </select>
+          <button type="button" class="btn btn-sm ${item.bonusResult==='correct'?'btn-brass':''}" data-live-bonus-result="${mi}|${roundKey}|${idx}|correct" ${!item.bonusCid?'disabled':''}>✓</button>
+          <button type="button" class="btn btn-sm ${item.bonusResult==='wrong'?'btn-danger':''}" data-live-bonus-result="${mi}|${roundKey}|${idx}|wrong" ${!item.bonusCid?'disabled':''}>✗</button>
+        `:''}
+      </div>`;
+    });
+    html += `</div>`;
+    return html;
+  }
+
+  function renderSpeedRaceRound(m, mi, names, slots){
+    let html = `<div class="round-block">
+      <div class="round-head">Speed Race <span class="pill">1st +3 · 2nd +2 · 3rd +1 · wrong -1</span></div>`;
+    m.live.speedRace.forEach((item, idx)=>{
+      html += `<div class="round-item">
+        <select data-live-subject="${mi}|speedRace|${idx}">
+          ${SUBJECTS.map(s=>`<option value="${s}" ${item.subject===s?'selected':''}>${s}</option>`).join('')}
+        </select>`;
+      const ordinals = ['1st','2nd','3rd'];
+      for(let slotPos=0; slotPos<3; slotPos++){
+        if(slotPos>0){
+          const prev = item.attempts[slotPos-1];
+          if(!prev || prev.result!=='wrong') break; // only reveal next attempt after a wrong one
+        }
+        const att = item.attempts[slotPos];
+        const usedCids = item.attempts.slice(0,slotPos).map(a=>a&&a.cid).filter(Boolean);
+        html += `<span class="attempt-slot">
+          <select data-live-speed-cid="${mi}|${idx}|${slotPos}">
+            <option value="">${ordinals[slotPos]}…</option>
+            ${slots.filter(cid=>!usedCids.includes(cid)).map(cid=>`<option value="${cid}" ${att&&att.cid===cid?'selected':''}>${escapeHtml(names[cid])}</option>`).join('')}
+          </select>
+          <button type="button" class="btn btn-sm ${att&&att.result==='correct'?'btn-brass':''}" data-live-speed-result="${mi}|${idx}|${slotPos}|correct" ${!att||!att.cid?'disabled':''}>✓</button>
+          <button type="button" class="btn btn-sm ${att&&att.result==='wrong'?'btn-danger':''}" data-live-speed-result="${mi}|${idx}|${slotPos}|wrong" ${!att||!att.cid?'disabled':''}>✗</button>
+        </span>`;
+      }
+      html += `</div>`;
+    });
+    html += `</div>`;
+    return html;
+  }
+
+  function renderPotdRound(m, mi, names, slots){
+    const skipped = m.live.skip && m.live.skip.potd;
+    let html = `<div class="round-block">
+      <div class="round-head">Problem of the Day <span class="pill">out of 10</span>
+        <label class="checkbox-row" style="display:inline-flex;margin-left:10px;">
+          <input type="checkbox" data-live-potd-skip="${mi}" ${skipped?'checked':''}> Skip this round
+        </label>
+      </div>`;
+    if(!skipped){
+      html += `<div class="row" style="margin-bottom:8px;"><div style="max-width:200px;">
+        <label class="field">Subject</label>
+        <select data-live-potd-subject="${mi}">
+          ${SUBJECTS.map(s=>`<option value="${s}" ${m.live.potd.subject===s?'selected':''}>${s}</option>`).join('')}
+        </select>
+      </div></div>`;
+      slots.forEach(cid=>{
+        const val = m.live.potd.scores[cid];
+        html += `<div class="round-item">
+          <span class="name" style="flex:1;">${escapeHtml(names[cid])}</span>
+          <input type="number" min="0" max="10" step="any" class="score-input" data-live-potd-score="${mi}|${cid}" value="${val!==undefined?val:''}">
+        </div>`;
+      });
+    }
+    html += `</div>`;
+    return html;
+  }
+
+  function renderRiddlesRound(m, mi, names, slots){
+    let html = `<div class="round-block">
+      <div class="round-head">Riddles <span class="pill">1st clue +5 · 2nd +4 · 3rd+ +3 · wrong 0</span></div>`;
+    m.live.riddles.forEach((item, idx)=>{
+      html += `<div class="round-item">
+        <select data-live-subject="${mi}|riddles|${idx}">
+          ${SUBJECTS.map(s=>`<option value="${s}" ${item.subject===s?'selected':''}>${s}</option>`).join('')}
+        </select>
+        <select data-live-riddle-winner="${mi}|${idx}">
+          <option value="">Nobody solved it…</option>
+          ${slots.map(cid=>`<option value="${cid}" ${item.winnerCid===cid?'selected':''}>${escapeHtml(names[cid])}</option>`).join('')}
+        </select>
+        <select data-live-riddle-clue="${mi}|${idx}" ${!item.winnerCid?'disabled':''}>
+          <option value="">Clue…</option>
+          <option value="1" ${item.clue==1?'selected':''}>1st clue (+5)</option>
+          <option value="2" ${item.clue==2?'selected':''}>2nd clue (+4)</option>
+          <option value="3" ${item.clue==3?'selected':''}>3rd+ clue (+3)</option>
+        </select>
+      </div>`;
+    });
+    html += `</div>`;
+    return html;
+  }
+
+  function renderStandingsTable(t, stage, stageIdx, canEdit){
     const standings = computeStandings(t, stage);
     const anyCompleted = stage.matches.some(m=>m.completed);
     if(!anyCompleted){
@@ -922,7 +1180,7 @@
     const allComplete = stage.matches.every(m=>m.completed);
     const isLastStage = stageIdx === t.stages.length-1;
     const isFinalDecider = isLastStage && stage.competitorIds.length<=3;
-    const showQualifyCheckboxes = allComplete && ui.isCoach && !isFinalDecider;
+    const showQualifyCheckboxes = allComplete && canEdit && !isFinalDecider;
 
     if(showQualifyCheckboxes && (!ui.qualifySelection || ui.qualifySelectionStage!==stage.key)){
       const defaultN = suggestQualifyN(standings.length);
@@ -953,10 +1211,12 @@
       <button class="btn btn-sm btn-ghost" data-export-csv="${stageIdx}">⬇ Download CSV</button>
     </div>`;
 
-    if(allComplete && !ui.isCoach){
+    if(!canEdit && allComplete && stage.qualifiedIds){
+      html += `<div class="divider"></div><p class="small-note">This stage is resolved — ${stage.qualifiedIds.length} qualified through to the next stage.</p>`;
+    } else if(allComplete && !ui.isCoach){
       html += `<div class="divider"></div><p class="small-note">All matches in — ask your coach to advance the tournament to the next stage.</p>`;
     }
-    if(allComplete && ui.isCoach){
+    if(allComplete && canEdit){
       if(isFinalDecider){
         html += `<div class="divider"></div>
           <p class="small-note">All matches recorded. Declare the champion:</p>
@@ -1042,6 +1302,7 @@
       </div>`;
 
     const profiles = buildAllProfiles();
+    const breakdown = buildContestBreakdown();
     let names = Object.keys(profiles);
     if(ui.profileFilter.trim()){
       const q = ui.profileFilter.trim().toLowerCase();
@@ -1056,11 +1317,20 @@
 
     names.forEach(name=>{
       const p = profiles[name];
+      const bd = breakdown[name];
       const winRate = p.totalPlayed>0 ? Math.round(100*p.firsts/p.totalPlayed) : 0;
+      const expanded = ui.expandedProfile === name;
+      const att = computeAttendancePct(name);
+      const asm = computeAssessmentPct(name);
+      const quizPct = computeQuizPct(name, profiles);
+      const agg = computeAggregate(att.pct, att.count, asm.pct, asm.count, quizPct);
       html += `<div class="profile-card">
         <div class="profile-head">
           <h3>${escapeHtml(name)}</h3>
-          <span class="pill">${p.tournaments.size} tournament${p.tournaments.size!==1?'s':''}</span>
+          <div style="display:flex; gap:6px; align-items:center;">
+            ${agg!=null?`<span class="pill gold">${agg.toFixed(1)}% selection score</span>`:''}
+            <span class="pill">${p.tournaments.size} tournament${p.tournaments.size!==1?'s':''}</span>
+          </div>
         </div>
         <div class="stat-grid">
           <div class="stat-box"><div class="v">${p.totalPlayed}</div><div class="l">Matches</div></div>
@@ -1068,8 +1338,25 @@
           <div class="stat-box"><div class="v">${p.firsts}</div><div class="l">1st place</div></div>
           <div class="stat-box"><div class="v">${winRate}%</div><div class="l">Win rate</div></div>
           <div class="stat-box"><div class="v">${p.avgRank.toFixed(1)}</div><div class="l">Avg rank</div></div>
-        </div>
-      </div>`;
+        </div>`;
+      if(bd){
+        html += `<button type="button" class="btn btn-sm btn-ghost" style="margin-top:10px;" data-toggle-profile="${escapeAttr(name)}">${expanded?'▾ Hide':'▸ Show'} contest analysis (subject &amp; round breakdown)</button>`;
+        if(expanded){
+          html += `<div class="divider"></div><div class="small-note" style="margin-bottom:4px;">By subject</div>`;
+          SUBJECTS.forEach(s=>{
+            const v = bd.bySubject[s];
+            html += `<div class="subj-row"><span>${s}</span><span class="mono">${v.pts>0?'+':''}${v.pts.toFixed(1).replace(/\.0$/,'')} pts (${v.correct}✓ / ${v.wrong}✗)</span></div>`;
+          });
+          html += `<div class="small-note" style="margin:10px 0 4px;">By round</div>`;
+          const r = bd.byRound;
+          html += `<div class="subj-row"><span>Fundamentals</span><span class="mono">${r.fundamentals.pts.toFixed(1).replace(/\.0$/,'')} pts (${r.fundamentals.correct}✓ / ${r.fundamentals.wrong}✗)</span></div>`;
+          html += `<div class="subj-row"><span>Speed Race</span><span class="mono">${r.speedRace.pts.toFixed(1).replace(/\.0$/,'')} pts (${r.speedRace.correct}✓ / ${r.speedRace.wrong}✗)</span></div>`;
+          html += `<div class="subj-row"><span>Problem of the Day</span><span class="mono">${r.potd.pts.toFixed(1).replace(/\.0$/,'')} pts (${r.potd.count} attempt${r.potd.count!==1?'s':''})</span></div>`;
+          html += `<div class="subj-row"><span>True/False</span><span class="mono">${r.trueFalse.pts.toFixed(1).replace(/\.0$/,'')} pts (${r.trueFalse.correct}✓ / ${r.trueFalse.wrong}✗)</span></div>`;
+          html += `<div class="subj-row"><span>Riddles</span><span class="mono">${r.riddles.pts.toFixed(1).replace(/\.0$/,'')} pts (${r.riddles.solved} solved)</span></div>`;
+        }
+      }
+      html += `</div>`;
     });
     return html;
   }
@@ -1113,7 +1400,7 @@
               const p = ensure(nm);
               p.tournaments.add(t.id);
               p.totalPlayed++;
-              p.totalPts += POINTS[r.rank]||0;
+              p.totalPts += (typeof r.points==='number') ? r.points : (POINTS[r.rank]||0);
               if(r.rank===1) p.firsts++;
               p.rankSum += r.rank;
             });
@@ -1123,6 +1410,289 @@
     });
     Object.values(profiles).forEach(p=>{ p.avgRank = p.totalPlayed>0 ? p.rankSum/p.totalPlayed : 0; });
     return profiles;
+  }
+
+  // Subject- and round-level breakdown from live NSMQ scoring data, for contest-analysis reports.
+  function buildContestBreakdown(){
+    const out = {};
+    function ensure(name){
+      if(!out[name]) out[name] = {
+        bySubject: Object.fromEntries(SUBJECTS.map(s=>[s,{correct:0,wrong:0,pts:0}])),
+        byRound: {
+          fundamentals:{pts:0,correct:0,wrong:0},
+          speedRace:{pts:0,correct:0,wrong:0},
+          potd:{pts:0,count:0},
+          trueFalse:{pts:0,correct:0,wrong:0},
+          riddles:{pts:0,solved:0}
+        }
+      };
+      return out[name];
+    }
+    (DB.fullCache||[]).forEach(t=>{
+      (t.stages||[]).forEach(stage=>{
+        (stage.matches||[]).forEach(m=>{
+          if(!m.completed || !m.live) return;
+          const cidNames = {};
+          m.slots.forEach(cid=>{
+            const comp = (t.competitors||[]).find(c=>c.id===cid);
+            if(comp) cidNames[cid] = comp.memberNames && comp.memberNames.length ? comp.memberNames : [comp.name];
+          });
+          function credit(cid, subject, pts, isCorrect, roundKey){
+            const names = cidNames[cid]; if(!names) return;
+            names.forEach(nm=>{
+              const p = ensure(nm);
+              if(subject){
+                p.bySubject[subject].pts += pts;
+                if(isCorrect===true) p.bySubject[subject].correct++;
+                if(isCorrect===false) p.bySubject[subject].wrong++;
+              }
+              const rb = p.byRound[roundKey];
+              rb.pts += pts;
+              if(roundKey==='potd'){ rb.count++; return; }
+              if(roundKey==='riddles'){ if(isCorrect) rb.solved++; return; }
+              if(isCorrect===true) rb.correct++;
+              if(isCorrect===false) rb.wrong++;
+            });
+          }
+          (m.live.fundamentals||[]).forEach(item=>{
+            if(item.mainCid && item.mainResult){
+              const pts = item.mainResult==='correct'?ROUND_INFO.fundamentals.mainCorrect:ROUND_INFO.fundamentals.mainWrong;
+              credit(item.mainCid, item.subject, pts, item.mainResult==='correct', 'fundamentals');
+            }
+            if(item.bonusCid && item.bonusResult){
+              const pts = item.bonusResult==='correct'?ROUND_INFO.fundamentals.bonusCorrect:ROUND_INFO.fundamentals.bonusWrong;
+              credit(item.bonusCid, item.subject, pts, item.bonusResult==='correct', 'fundamentals');
+            }
+          });
+          (m.live.speedRace||[]).forEach(item=>{
+            (item.attempts||[]).forEach((att,idx)=>{
+              if(!att || !att.cid || !att.result) return;
+              const ladder = ROUND_INFO.speedRace.ladder[idx]!==undefined?ROUND_INFO.speedRace.ladder[idx]:1;
+              const pts = att.result==='correct'?ladder:ROUND_INFO.speedRace.wrong;
+              credit(att.cid, item.subject, pts, att.result==='correct', 'speedRace');
+            });
+          });
+          if(m.live.potd && !(m.live.skip&&m.live.skip.potd)){
+            Object.entries(m.live.potd.scores||{}).forEach(([cid,score])=>{
+              credit(cid, m.live.potd.subject, parseFloat(score)||0, null, 'potd');
+            });
+          }
+          (m.live.trueFalse||[]).forEach(item=>{
+            if(item.mainCid && item.mainResult){
+              const pts = item.mainResult==='correct'?ROUND_INFO.trueFalse.mainCorrect:ROUND_INFO.trueFalse.mainWrong;
+              credit(item.mainCid, item.subject, pts, item.mainResult==='correct', 'trueFalse');
+            }
+            if(item.bonusCid && item.bonusResult){
+              const pts = item.bonusResult==='correct'?ROUND_INFO.trueFalse.bonusCorrect:ROUND_INFO.trueFalse.bonusWrong;
+              credit(item.bonusCid, item.subject, pts, item.bonusResult==='correct', 'trueFalse');
+            }
+          });
+          (m.live.riddles||[]).forEach(item=>{
+            if(item.winnerCid && item.clue){
+              const pts = ROUND_INFO.riddles.cluePoints[item.clue]||ROUND_INFO.riddles.cluePoints[3];
+              credit(item.winnerCid, item.subject, pts, true, 'riddles');
+            }
+          });
+        });
+      });
+    });
+    return out;
+  }
+
+  /* ============================= SQUAD: ATTENDANCE, ASSESSMENTS, AGGREGATE SCORE ============================= */
+  function computeAttendancePct(name){
+    let present=0, total=0;
+    (DB.meetings||[]).forEach(mt=>{
+      if(mt.attendance && Object.prototype.hasOwnProperty.call(mt.attendance, name)){
+        total++;
+        if(mt.attendance[name]) present++;
+      }
+    });
+    return { pct: total>0 ? (present/total*100) : 0, count: total, present };
+  }
+
+  function computeAssessmentPct(name){
+    let sum=0, count=0;
+    (DB.assessments||[]).forEach(as=>{
+      if(as.scores && Object.prototype.hasOwnProperty.call(as.scores, name) && as.maxScore>0){
+        sum += (as.scores[name]/as.maxScore)*100;
+        count++;
+      }
+    });
+    return { pct: count>0 ? sum/count : 0, count };
+  }
+
+  function computeQuizPct(name, profiles){
+    const p = profiles[name];
+    if(!p || p.totalPlayed===0) return null;
+    const val = ((3 - p.avgRank)/2)*100; // rank1=100%, rank2=50%, rank3=0%
+    return Math.max(0, Math.min(100, val));
+  }
+
+  function computeAggregate(attPct, attCount, asmPct, asmCount, quizPct){
+    const w = DB.weights;
+    const parts = [];
+    if(attCount>0) parts.push({v:attPct, w:w.attendance||0});
+    if(asmCount>0) parts.push({v:asmPct, w:w.assessment||0});
+    if(quizPct!=null) parts.push({v:quizPct, w:w.quiz||0});
+    const totalW = parts.reduce((a,b)=>a+b.w,0);
+    if(parts.length===0 || totalW<=0) return null;
+    return parts.reduce((a,b)=>a+b.v*b.w,0)/totalW;
+  }
+
+  function renderSquad(){
+    let html = `<h2 class="display" style="font-size:22px;">Squad</h2>
+      <p class="sub">Attendance, assessments, and quiz performance combined into one selection score.</p>`;
+    html += renderWeightsCard();
+    html += renderAggregateTable();
+    html += renderMeetingsSection();
+    html += renderAssessmentsSection();
+    return html;
+  }
+
+  function renderWeightsCard(){
+    const w = DB.weights;
+    let html = `<div class="card">
+      <h2>Selection weights</h2>
+      <p class="sub">How attendance, assessments, and quiz performance combine into the aggregate score below. A student missing one category (e.g. no assessments yet) is scored on the remaining categories only.</p>`;
+    if(ui.isCoach){
+      html += `<div class="row">
+        <div><label class="field">Attendance</label><input type="number" min="0" id="f-weight-attendance" value="${w.attendance}"></div>
+        <div><label class="field">Assessments</label><input type="number" min="0" id="f-weight-assessment" value="${w.assessment}"></div>
+        <div><label class="field">Quiz performance</label><input type="number" min="0" id="f-weight-quiz" value="${w.quiz}"></div>
+        <div style="flex:0;"><button class="btn btn-brass" data-save-weights="1">Save</button></div>
+      </div>
+      <p class="small-note">These are relative proportions, not required to add up to 100.</p>`;
+    } else {
+      html += `<p class="small-note">Current weights — Attendance: ${w.attendance} · Assessments: ${w.assessment} · Quiz: ${w.quiz}</p>`;
+    }
+    html += `</div>`;
+    return html;
+  }
+
+  function renderAggregateTable(){
+    const profiles = buildAllProfiles();
+    const names = DB.roster.slice().sort();
+    let rows = names.map(name=>{
+      const att = computeAttendancePct(name);
+      const asm = computeAssessmentPct(name);
+      const quiz = computeQuizPct(name, profiles);
+      const agg = computeAggregate(att.pct, att.count, asm.pct, asm.count, quiz);
+      return {name, att, asm, quiz, agg};
+    });
+    rows.sort((a,b)=>(b.agg==null?-1:b.agg)-(a.agg==null?-1:a.agg));
+
+    let html = `<div class="card">
+      <h2>Aggregate selection ranking</h2>`;
+    if(rows.length===0){
+      html += `<p class="small-note">No students on the roster yet — add contestants through a tournament, or add them directly below.</p>`;
+    } else {
+      html += `<table><thead><tr><th>#</th><th>Name</th><th>Attendance</th><th>Assessments</th><th>Quiz</th><th>Aggregate</th></tr></thead><tbody>`;
+      rows.forEach((r,i)=>{
+        html += `<tr>
+          <td class="rank-num">${i+1}</td>
+          <td>${escapeHtml(r.name)}</td>
+          <td class="mono">${r.att.count>0?Math.round(r.att.pct)+'%':'—'}</td>
+          <td class="mono">${r.asm.count>0?Math.round(r.asm.pct)+'%':'—'}</td>
+          <td class="mono">${r.quiz!=null?Math.round(r.quiz)+'%':'—'}</td>
+          <td class="mono" style="color:var(--brass-soft);font-weight:700;">${r.agg!=null?r.agg.toFixed(1)+'%':'—'}</td>
+        </tr>`;
+      });
+      html += `</tbody></table>`;
+    }
+    if(ui.isCoach){
+      html += `<div class="divider"></div>
+        <div class="row">
+          <div><input type="text" id="f-roster-add" placeholder="Add a student to the squad roster…"></div>
+          <div style="flex:0;"><button class="btn btn-sm" data-add-roster="1">Add</button></div>
+        </div>`;
+    }
+    html += `</div>`;
+    return html;
+  }
+
+  function renderMeetingsSection(){
+    let html = `<div class="card">
+      <h2>Meetings &amp; attendance</h2>`;
+    if(ui.isCoach){
+      html += `<div class="row">
+        <div><input type="text" id="f-meeting-name" placeholder="Meeting name (e.g. Tuesday training)"></div>
+        <div><input type="date" id="f-meeting-date"></div>
+        <div style="flex:0;"><button class="btn" data-add-meeting="1">Add meeting</button></div>
+      </div>`;
+    }
+    html += `<div class="divider"></div>`;
+    const meetings = (DB.meetings||[]).slice().sort((a,b)=>b.createdAt-a.createdAt);
+    if(meetings.length===0){
+      html += `<p class="small-note">No meetings logged yet.</p>`;
+    }
+    meetings.forEach(mt=>{
+      const presentCount = Object.values(mt.attendance||{}).filter(Boolean).length;
+      const totalCount = Object.keys(mt.attendance||{}).length;
+      const expanded = ui.expandedMeeting === mt.id;
+      html += `<div class="t-list-item" data-toggle-meeting="${mt.id}">
+        <div><h3>${escapeHtml(mt.name)}</h3><p>${mt.date?mt.date+' · ':''}${presentCount}/${totalCount} present</p></div>
+        <span class="pill">${expanded?'▾':'▸'}</span>
+      </div>`;
+      if(expanded){
+        html += `<div class="card" style="background:var(--panel-2); margin-top:-4px; margin-bottom:14px;">`;
+        DB.roster.slice().sort().forEach(name=>{
+          const present = !!(mt.attendance && mt.attendance[name]);
+          html += `<label class="checkbox-row" style="margin-bottom:8px;">
+            <input type="checkbox" data-meeting-attendance="${mt.id}|${escapeAttr(name)}" ${present?'checked':''} ${ui.isCoach?'':'disabled'}>
+            ${escapeHtml(name)}
+          </label>`;
+        });
+        if(ui.isCoach){
+          html += `<button class="btn btn-sm btn-danger" data-delete-meeting="${mt.id}" style="margin-top:6px;">Delete meeting</button>`;
+        }
+        html += `</div>`;
+      }
+    });
+    html += `</div>`;
+    return html;
+  }
+
+  function renderAssessmentsSection(){
+    let html = `<div class="card">
+      <h2>Assessments &amp; exams</h2>`;
+    if(ui.isCoach){
+      html += `<div class="row">
+        <div><input type="text" id="f-assessment-name" placeholder="Test name (e.g. Biology Mock 1)"></div>
+        <div><label class="field">Max score</label><input type="number" id="f-assessment-max" min="1" value="100"></div>
+        <div><label class="field">Date</label><input type="date" id="f-assessment-date"></div>
+        <div style="flex:0;"><button class="btn" data-add-assessment="1">Add assessment</button></div>
+      </div>`;
+    }
+    html += `<div class="divider"></div>`;
+    const assessments = (DB.assessments||[]).slice().sort((a,b)=>b.createdAt-a.createdAt);
+    if(assessments.length===0){
+      html += `<p class="small-note">No assessments logged yet.</p>`;
+    }
+    assessments.forEach(as=>{
+      const count = Object.keys(as.scores||{}).length;
+      const expanded = ui.expandedAssessment === as.id;
+      html += `<div class="t-list-item" data-toggle-assessment="${as.id}">
+        <div><h3>${escapeHtml(as.name)}</h3><p>${as.date?as.date+' · ':''}out of ${as.maxScore} · ${count} scored</p></div>
+        <span class="pill">${expanded?'▾':'▸'}</span>
+      </div>`;
+      if(expanded){
+        html += `<div class="card" style="background:var(--panel-2); margin-top:-4px; margin-bottom:14px;">`;
+        DB.roster.slice().sort().forEach(name=>{
+          const val = as.scores ? as.scores[name] : undefined;
+          html += `<div class="row" style="margin-bottom:8px; align-items:center;">
+            <div style="flex:2;">${escapeHtml(name)}</div>
+            <div style="max-width:100px;"><input type="number" min="0" max="${as.maxScore}" step="any" data-assessment-score="${as.id}|${escapeAttr(name)}" value="${val!==undefined?val:''}" ${ui.isCoach?'':'disabled'}></div>
+          </div>`;
+        });
+        if(ui.isCoach){
+          html += `<button class="btn btn-sm btn-danger" data-delete-assessment="${as.id}" style="margin-top:6px;">Delete assessment</button>`;
+        }
+        html += `</div>`;
+      }
+    });
+    html += `</div>`;
+    return html;
   }
 
   /* ============================= EVENTS ============================= */
@@ -1195,6 +1765,11 @@
       });
     });
 
+    qa('[data-view-stage]').forEach(el=>el.addEventListener('click', ()=>{
+      ui.viewingStageIdx = parseInt(el.getAttribute('data-view-stage'));
+      render();
+    }));
+
     const undoAdvanceBtn = q('[data-undo-advance]');
     if(undoAdvanceBtn) undoAdvanceBtn.addEventListener('click', ()=>{
       const t = currentTournament;
@@ -1202,6 +1777,7 @@
       openConfirm('Undo advance?', `This deletes the "${escapeHtml(t.stages[t.stages.length-1].label)}" stage and its fixture, returning you to "${escapeHtml(prevLabel)}" so you can re-check standings or qualifiers. This cannot be undone.`, async ()=>{
         t.stages.pop();
         t.currentStageIndex = t.stages.length-1;
+        ui.viewingStageIdx = t.currentStageIndex;
         await saveCurrentTournament();
         render();
       });
@@ -1257,14 +1833,108 @@
       render();
     }));
 
-    qa('[data-save-match]').forEach(el=>el.addEventListener('click', async ()=>{
-      await saveMatchResult(parseInt(el.getAttribute('data-save-match')));
+    qa('[data-toggle-live-scorer]').forEach(el=>el.addEventListener('click', ()=>{
+      const key = el.getAttribute('data-toggle-live-scorer');
+      ui.openLiveScorerKey = (ui.openLiveScorerKey===key) ? null : key;
+      render();
     }));
-    qa('[data-edit-match]').forEach(el=>el.addEventListener('click', ()=>{
-      const mi = parseInt(el.getAttribute('data-edit-match'));
-      currentTournament.stages[currentTournament.currentStageIndex].matches[mi].completed = false;
+
+    qa('[data-live-subject]').forEach(el=>el.addEventListener('change', e=>{
+      const [mi, roundKey, idx] = el.getAttribute('data-live-subject').split('|');
+      const m = currentTournament.stages[currentTournament.currentStageIndex].matches[parseInt(mi)];
+      initLiveScoring(m);
+      m.live[roundKey][parseInt(idx)].subject = e.target.value;
       saveCurrentTournament(); render();
     }));
+    qa('[data-live-main-cid]').forEach(el=>el.addEventListener('change', e=>{
+      const [mi, roundKey, idx] = el.getAttribute('data-live-main-cid').split('|');
+      const m = currentTournament.stages[currentTournament.currentStageIndex].matches[parseInt(mi)];
+      const item = m.live[roundKey][parseInt(idx)];
+      item.mainCid = e.target.value || null;
+      item.mainResult = null; item.bonusCid = null; item.bonusResult = null;
+      saveCurrentTournament(); render();
+    }));
+    qa('[data-live-main-result]').forEach(el=>el.addEventListener('click', ()=>{
+      const [mi, roundKey, idx, result] = el.getAttribute('data-live-main-result').split('|');
+      const m = currentTournament.stages[currentTournament.currentStageIndex].matches[parseInt(mi)];
+      const item = m.live[roundKey][parseInt(idx)];
+      item.mainResult = result;
+      if(result==='correct'){ item.bonusCid=null; item.bonusResult=null; }
+      saveCurrentTournament(); render();
+    }));
+    qa('[data-live-bonus-cid]').forEach(el=>el.addEventListener('change', e=>{
+      const [mi, roundKey, idx] = el.getAttribute('data-live-bonus-cid').split('|');
+      const m = currentTournament.stages[currentTournament.currentStageIndex].matches[parseInt(mi)];
+      const item = m.live[roundKey][parseInt(idx)];
+      item.bonusCid = e.target.value || null;
+      item.bonusResult = null;
+      saveCurrentTournament(); render();
+    }));
+    qa('[data-live-bonus-result]').forEach(el=>el.addEventListener('click', ()=>{
+      const [mi, roundKey, idx, result] = el.getAttribute('data-live-bonus-result').split('|');
+      const m = currentTournament.stages[currentTournament.currentStageIndex].matches[parseInt(mi)];
+      m.live[roundKey][parseInt(idx)].bonusResult = result;
+      saveCurrentTournament(); render();
+    }));
+
+    qa('[data-live-speed-cid]').forEach(el=>el.addEventListener('change', e=>{
+      const [mi, idx, slotPos] = el.getAttribute('data-live-speed-cid').split('|').map(Number);
+      const m = currentTournament.stages[currentTournament.currentStageIndex].matches[mi];
+      const cid = e.target.value || null;
+      m.live.speedRace[idx].attempts[slotPos] = cid ? { cid, result:null } : null;
+      // clear any later attempts since order matters
+      for(let k=slotPos+1;k<3;k++) m.live.speedRace[idx].attempts[k] = null;
+      saveCurrentTournament(); render();
+    }));
+    qa('[data-live-speed-result]').forEach(el=>el.addEventListener('click', ()=>{
+      const [mi, idx, slotPos, result] = el.getAttribute('data-live-speed-result').split('|');
+      const m = currentTournament.stages[currentTournament.currentStageIndex].matches[parseInt(mi)];
+      m.live.speedRace[parseInt(idx)].attempts[parseInt(slotPos)].result = result;
+      saveCurrentTournament(); render();
+    }));
+
+    const potdSkipEl = q('[data-live-potd-skip]');
+    if(potdSkipEl) potdSkipEl.addEventListener('change', e=>{
+      const mi = parseInt(potdSkipEl.getAttribute('data-live-potd-skip'));
+      const m = currentTournament.stages[currentTournament.currentStageIndex].matches[mi];
+      initLiveScoring(m);
+      m.live.skip.potd = e.target.checked;
+      saveCurrentTournament(); render();
+    });
+    const potdSubjEl = q('[data-live-potd-subject]');
+    if(potdSubjEl) potdSubjEl.addEventListener('change', e=>{
+      const mi = parseInt(potdSubjEl.getAttribute('data-live-potd-subject'));
+      const m = currentTournament.stages[currentTournament.currentStageIndex].matches[mi];
+      m.live.potd.subject = e.target.value;
+      saveCurrentTournament(); render();
+    });
+    qa('[data-live-potd-score]').forEach(el=>el.addEventListener('change', e=>{
+      const [mi, cid] = el.getAttribute('data-live-potd-score').split('|');
+      const m = currentTournament.stages[currentTournament.currentStageIndex].matches[parseInt(mi)];
+      const val = e.target.value;
+      if(val===''){ delete m.live.potd.scores[cid]; }
+      else { m.live.potd.scores[cid] = parseFloat(val); }
+      saveCurrentTournament(); render();
+    }));
+
+    qa('[data-live-riddle-winner]').forEach(el=>el.addEventListener('change', e=>{
+      const [mi, idx] = el.getAttribute('data-live-riddle-winner').split('|').map(Number);
+      const m = currentTournament.stages[currentTournament.currentStageIndex].matches[mi];
+      m.live.riddles[idx].winnerCid = e.target.value || null;
+      m.live.riddles[idx].clue = null;
+      saveCurrentTournament(); render();
+    }));
+    qa('[data-live-riddle-clue]').forEach(el=>el.addEventListener('change', e=>{
+      const [mi, idx] = el.getAttribute('data-live-riddle-clue').split('|').map(Number);
+      const m = currentTournament.stages[currentTournament.currentStageIndex].matches[mi];
+      m.live.riddles[idx].clue = e.target.value ? parseInt(e.target.value) : null;
+      saveCurrentTournament(); render();
+    }));
+
+    const finishLiveBtn = q('[data-finish-live-match]');
+    if(finishLiveBtn) finishLiveBtn.addEventListener('click', ()=>{
+      finishLiveMatch(parseInt(finishLiveBtn.getAttribute('data-finish-live-match')));
+    });
 
     const advanceBtn = q('[data-advance-stage]');
     if(advanceBtn) advanceBtn.addEventListener('click', advanceStage);
@@ -1306,6 +1976,46 @@
       openConfirm('Reset everything?', 'This deletes every tournament, roster entry and result. This cannot be undone.', resetEverything);
     });
 
+    // Squad: weights, roster, meetings, assessments
+    const saveWeightsBtn = q('[data-save-weights]');
+    if(saveWeightsBtn) saveWeightsBtn.addEventListener('click', saveWeights);
+    const addRosterBtn = q('[data-add-roster]');
+    if(addRosterBtn) addRosterBtn.addEventListener('click', addToRoster);
+    const rosterInput = q('#f-roster-add');
+    if(rosterInput) rosterInput.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); addToRoster(); } });
+
+    const addMeetingBtn = q('[data-add-meeting]');
+    if(addMeetingBtn) addMeetingBtn.addEventListener('click', addMeeting);
+    qa('[data-toggle-meeting]').forEach(el=>el.addEventListener('click', ()=>{
+      const id = el.getAttribute('data-toggle-meeting');
+      ui.expandedMeeting = (ui.expandedMeeting===id) ? null : id;
+      render();
+    }));
+    qa('[data-meeting-attendance]').forEach(el=>el.addEventListener('change', e=>{
+      const [mtId, name] = el.getAttribute('data-meeting-attendance').split('|');
+      toggleAttendance(mtId, name, e.target.checked);
+    }));
+    qa('[data-delete-meeting]').forEach(el=>el.addEventListener('click', ()=>{
+      const id = el.getAttribute('data-delete-meeting');
+      openConfirm('Delete this meeting?', 'This removes its attendance record permanently.', ()=>deleteMeeting(id));
+    }));
+
+    const addAssessmentBtn = q('[data-add-assessment]');
+    if(addAssessmentBtn) addAssessmentBtn.addEventListener('click', addAssessment);
+    qa('[data-toggle-assessment]').forEach(el=>el.addEventListener('click', ()=>{
+      const id = el.getAttribute('data-toggle-assessment');
+      ui.expandedAssessment = (ui.expandedAssessment===id) ? null : id;
+      render();
+    }));
+    qa('[data-assessment-score]').forEach(el=>el.addEventListener('change', e=>{
+      const [asId, name] = el.getAttribute('data-assessment-score').split('|');
+      saveAssessmentScore(asId, name, e.target.value);
+    }));
+    qa('[data-delete-assessment]').forEach(el=>el.addEventListener('click', ()=>{
+      const id = el.getAttribute('data-delete-assessment');
+      openConfirm('Delete this assessment?', 'This removes all recorded scores for it permanently.', ()=>deleteAssessment(id));
+    }));
+
     // modal
     const backdrop = q('[data-modal-backdrop]');
     if(backdrop){
@@ -1321,6 +2031,11 @@
 
     const profFilter = q('#f-profile-filter');
     if(profFilter) profFilter.addEventListener('input', e=>{ ui.profileFilter = e.target.value; render(); });
+    qa('[data-toggle-profile]').forEach(el=>el.addEventListener('click', ()=>{
+      const name = el.getAttribute('data-toggle-profile');
+      ui.expandedProfile = (ui.expandedProfile===name) ? null : name;
+      render();
+    }));
 
     // Coach PIN controls
     const openPinBtn = q('[data-open-pin]');
@@ -1439,6 +2154,7 @@
     ui.view = 'tournament';
     ui.qualifySelection = null;
     ui.qualifySelectionStage = null;
+    ui.viewingStageIdx = t.currentStageIndex;
     render();
   }
 
@@ -1538,10 +2254,108 @@
     DB.tIndex = [];
     DB.roster = [];
     DB.fullCache = [];
+    DB.meetings = [];
+    DB.assessments = [];
+    DB.weights = {attendance:30, assessment:30, quiz:40};
     await sSet('tournament_index', []);
     await sSet('roster', []);
+    await sSet('meetings', []);
+    await sSet('assessments', []);
+    await sSet('selection_weights', DB.weights);
     currentTournament = null;
     ui.view = 'home';
+    render();
+  }
+
+  async function saveWeights(){
+    if(!ui.isCoach) return;
+    const a = parseFloat((q('#f-weight-attendance')||{}).value)||0;
+    const s = parseFloat((q('#f-weight-assessment')||{}).value)||0;
+    const qz = parseFloat((q('#f-weight-quiz')||{}).value)||0;
+    DB.weights = {attendance:a, assessment:s, quiz:qz};
+    await sSet('selection_weights', DB.weights);
+    toast('Weights saved.', 'success');
+    render();
+  }
+
+  async function addToRoster(){
+    if(!ui.isCoach) return;
+    const el = q('#f-roster-add');
+    const name = (el ? el.value : '').trim();
+    if(!name) return;
+    if(!DB.roster.includes(name)){
+      DB.roster.push(name);
+      await sSet('roster', DB.roster);
+    } else {
+      toast('That name is already on the roster.', 'error');
+    }
+    render();
+  }
+
+  async function addMeeting(){
+    if(!ui.isCoach) return;
+    const nameEl = q('#f-meeting-name');
+    const dateEl = q('#f-meeting-date');
+    const name = (nameEl ? nameEl.value : '').trim();
+    if(!name){ toast('Enter a meeting name.', 'error'); return; }
+    const date = dateEl ? dateEl.value : '';
+    const attendance = {};
+    DB.roster.forEach(n=>{ attendance[n] = false; });
+    const mt = { id: uid('mt'), name, date, createdAt: Date.now(), attendance };
+    DB.meetings.push(mt);
+    await sSet('meetings', DB.meetings);
+    ui.expandedMeeting = mt.id;
+    render();
+  }
+
+  async function toggleAttendance(meetingId, name, checked){
+    if(!ui.isCoach) return;
+    const mt = DB.meetings.find(m=>m.id===meetingId);
+    if(!mt) return;
+    if(!mt.attendance) mt.attendance = {};
+    mt.attendance[name] = checked;
+    await sSet('meetings', DB.meetings);
+  }
+
+  async function deleteMeeting(id){
+    if(!ui.isCoach) return;
+    DB.meetings = DB.meetings.filter(m=>m.id!==id);
+    await sSet('meetings', DB.meetings);
+    ui.expandedMeeting = null;
+    render();
+  }
+
+  async function addAssessment(){
+    if(!ui.isCoach) return;
+    const nameEl = q('#f-assessment-name');
+    const maxEl = q('#f-assessment-max');
+    const dateEl = q('#f-assessment-date');
+    const name = (nameEl ? nameEl.value : '').trim();
+    if(!name){ toast('Enter a test name.', 'error'); return; }
+    const max = maxEl ? (parseFloat(maxEl.value)||100) : 100;
+    const date = dateEl ? dateEl.value : '';
+    const as = { id: uid('as'), name, maxScore:max, date, createdAt: Date.now(), scores:{} };
+    DB.assessments.push(as);
+    await sSet('assessments', DB.assessments);
+    ui.expandedAssessment = as.id;
+    render();
+  }
+
+  async function saveAssessmentScore(asId, name, value){
+    if(!ui.isCoach) return;
+    const as = DB.assessments.find(a=>a.id===asId);
+    if(!as) return;
+    if(!as.scores) as.scores = {};
+    if(value===''||value==null) delete as.scores[name];
+    else as.scores[name] = parseFloat(value);
+    await sSet('assessments', DB.assessments);
+  }
+
+  async function deleteAssessment(id){
+    if(!ui.isCoach) return;
+    DB.assessments = DB.assessments.filter(a=>a.id!==id);
+    await sSet('assessments', DB.assessments);
+    ui.expandedAssessment = null;
     render();
   }
 
@@ -1592,29 +2406,19 @@
     render();
   }
 
-  async function saveMatchResult(mi){
+  async function finishLiveMatch(mi){
     if(!ui.isCoach){ alert('Coach mode is required.'); return; }
     const t = currentTournament;
     const stage = t.stages[t.currentStageIndex];
     const m = stage.matches[mi];
-    const ranks = {};
-    let missing = false, dupe = false;
-    const seen = new Set();
-    m.slots.forEach(cid=>{
-      const rankEl = appEl.querySelector(`[data-rank-input="${mi}|${cid}"]`);
-      const scoreEl = appEl.querySelector(`[data-score-input="${mi}|${cid}"]`);
-      const rankVal = rankEl ? rankEl.value : '';
-      if(!rankVal){ missing = true; return; }
-      const rNum = parseInt(rankVal);
-      if(seen.has(rNum)) dupe = true;
-      seen.add(rNum);
-      ranks[cid] = { rank: rNum, score: scoreEl && scoreEl.value!=='' ? parseFloat(scoreEl.value) : undefined };
-    });
-    if(missing){ alert('Please set a rank (1st/2nd/3rd) for every player before saving.'); return; }
-    if(dupe){ alert('Two players cannot share the same rank in one match — check for a duplicate.'); return; }
-    m.results = ranks;
+    if(!m.live){ toast('Nothing scored yet.', 'error'); return; }
+    const totals = computeLiveTotals(m, m.slots);
+    const ranked = computeRanksFromScores(totals);
+    const anyTie = Object.values(ranked).some(r=>r.tied);
+    m.results = ranked;
     m.completed = true;
     await saveCurrentTournament();
+    toast(anyTie ? 'Tied score detected — points for that position were split evenly.' : 'Match result saved.', anyTie?'info':'success');
     render();
   }
 
@@ -1642,6 +2446,7 @@
     };
     t.stages.push(nextStage);
     t.currentStageIndex = t.stages.length-1;
+    ui.viewingStageIdx = t.currentStageIndex;
     await saveCurrentTournament();
     render();
   }
@@ -1664,9 +2469,15 @@
     const roster = await sGet('roster');
     const tIndex = await sGet('tournament_index');
     const coachPin = await sGet('coach_pin');
+    const meetings = await sGet('meetings');
+    const assessments = await sGet('assessments');
+    const weights = await sGet('selection_weights');
     DB.roster = roster || [];
     DB.tIndex = tIndex || [];
     DB.coachPin = coachPin || null;
+    DB.meetings = meetings || [];
+    DB.assessments = assessments || [];
+    DB.weights = weights || {attendance:30, assessment:30, quiz:40};
     DB.fullCache = [];
     // preload all tournament blobs for profile aggregation
     for(const summary of DB.tIndex){
