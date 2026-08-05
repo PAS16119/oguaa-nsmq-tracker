@@ -1522,6 +1522,31 @@
           html += `<div class="subj-row"><span>Riddles</span><span class="mono">${r.riddles.pts.toFixed(1).replace(/\.0$/,'')} pts (${r.riddles.solved} solved)</span></div>`;
         }
       }
+
+      const narrative = buildStudentNarrative(name, p, bd, att, asm);
+      if(narrative){
+        html += `<div class="divider"></div>
+          <div class="small-note" style="margin-bottom:4px;">Coach's read</div>
+          <p style="font-size:13px; color:var(--text); line-height:1.5; margin:0;">${escapeHtml(narrative)}</p>`;
+      }
+
+      const editingNotes = ui.editingNotesFor === name;
+      const existingNote = DB.notes[name] || '';
+      html += `<div class="divider"></div><div class="small-note" style="margin-bottom:4px;">Notes</div>`;
+      if(editingNotes){
+        html += `<textarea id="f-notes-${escapeAttr(name)}" rows="4" style="width:100%; font-family:'Inter',sans-serif; font-size:13px; padding:8px;">${escapeHtml(existingNote)}</textarea>
+          <div style="margin-top:6px; display:flex; gap:8px;">
+            <button class="btn btn-sm btn-brass" data-save-notes="${escapeAttr(name)}">Save</button>
+            <button class="btn btn-sm btn-ghost" data-cancel-notes="1">Cancel</button>
+          </div>`;
+      } else {
+        html += existingNote
+          ? `<p style="font-size:13px; color:var(--text); line-height:1.5; margin:0 0 8px;">${escapeHtml(existingNote)}</p>`
+          : `<p class="small-note" style="margin:0 0 8px;">No notes yet.</p>`;
+        if(ui.isStaff){
+          html += `<button class="btn btn-sm btn-ghost" data-edit-notes="${escapeAttr(name)}">${existingNote?'✏️ Edit notes':'+ Add a note'}</button>`;
+        }
+      }
       html += `</div>`;
     });
     return html;
@@ -1579,6 +1604,65 @@
   }
 
   // Subject- and round-level breakdown from live NSMQ scoring data, for contest-analysis reports.
+  // Builds a short auto-generated narrative from everything we already track for a student.
+  function buildStudentNarrative(name, p, bd, att, asm){
+    if(!p || p.totalPlayed===0) return `No recorded matches yet for ${name} — a narrative will build up automatically as results come in.`;
+    const parts = [];
+    const rankWord = p.avgRank<=1.5 ? 'consistently finishes at or near the top of the table'
+      : p.avgRank<=2.2 ? 'usually finishes mid-table'
+      : 'has mostly finished lower in matches so far';
+    parts.push(`${name} has played ${p.totalPlayed} match${p.totalPlayed!==1?'es':''} across ${p.tournaments.size} tournament${p.tournaments.size!==1?'s':''}, with ${p.firsts} first-place finish${p.firsts!==1?'es':''} and an average finishing position of ${p.avgRank.toFixed(1)} — ${rankWord}.`);
+
+    if(bd){
+      const subjEntries = SUBJECTS.map(s=>{
+        const v = bd.bySubject[s];
+        return { s, pts:v.pts, correct:v.correct, wrong:v.wrong, attempts:v.correct+v.wrong };
+      }).filter(x=>x.attempts>0);
+      if(subjEntries.length>0){
+        subjEntries.sort((a,b)=>b.pts-a.pts);
+        const strongest = subjEntries[0];
+        const weakest = subjEntries[subjEntries.length-1];
+        const sAcc = Math.round(100*strongest.correct/strongest.attempts);
+        parts.push(`Subject-wise, ${strongest.s} is the clear strength (${sAcc}% accuracy, ${strongest.pts.toFixed(1)} net points), which is worth leaning on in team selection.`);
+        if(weakest.s!==strongest.s && subjEntries.length>1){
+          const wAcc = Math.round(100*weakest.correct/weakest.attempts);
+          parts.push(`${weakest.s} is comparatively weaker (${wAcc}% accuracy) and would benefit from targeted practice.`);
+        }
+      }
+      const roundLabels = {fundamentals:'Fundamentals', speedRace:'the Speed Race', potd:'Problem of the Day', trueFalse:'True/False', riddles:'Riddles'};
+      const roundEntries = Object.keys(roundLabels).map(k=>{
+        const r = bd.byRound[k];
+        const attempts = k==='potd' ? r.count : (k==='riddles' ? r.solved : r.correct+r.wrong);
+        return { k, pts:r.pts, attempts };
+      }).filter(x=>x.attempts>0);
+      if(roundEntries.length>0){
+        roundEntries.sort((a,b)=>b.pts-a.pts);
+        const bestRound = roundEntries[0];
+        parts.push(`Round-by-round, performance peaks in ${roundLabels[bestRound.k]}.`);
+      }
+    }
+
+    if(att && att.count>0){
+      const attWord = att.pct>=90?'excellent':att.pct>=75?'good':att.pct>=50?'inconsistent':'a real concern';
+      parts.push(`Training attendance is ${attWord} at ${Math.round(att.pct)}% (${att.present}/${att.count} sessions).`);
+    }
+    if(asm && asm.count>0){
+      parts.push(`Across ${asm.count} logged assessment${asm.count!==1?'s':''}, the average is ${Math.round(asm.pct)}%.`);
+    }
+    return parts.join(' ');
+  }
+
+  async function saveStudentNote(name){
+    if(!ui.isStaff) return;
+    const el = appEl.querySelector(`[id="f-notes-${name.replace(/"/g,'\\"')}"]`);
+    const val = el ? el.value.trim() : '';
+    if(val) DB.notes[name] = val; else delete DB.notes[name];
+    await sSet('student_notes', DB.notes);
+    ui.editingNotesFor = null;
+    toast('Note saved.', 'success');
+    render();
+  }
+
   function buildContestBreakdown(){
     const out = {};
     function ensure(name){
@@ -2213,6 +2297,17 @@
     qa('[data-toggle-profile]').forEach(el=>el.addEventListener('click', ()=>{
       const name = el.getAttribute('data-toggle-profile');
       ui.expandedProfile = (ui.expandedProfile===name) ? null : name;
+      render();
+    }));
+    qa('[data-edit-notes]').forEach(el=>el.addEventListener('click', ()=>{
+      ui.editingNotesFor = el.getAttribute('data-edit-notes');
+      render();
+    }));
+    qa('[data-save-notes]').forEach(el=>el.addEventListener('click', ()=>{
+      saveStudentNote(el.getAttribute('data-save-notes'));
+    }));
+    qa('[data-cancel-notes]').forEach(el=>el.addEventListener('click', ()=>{
+      ui.editingNotesFor = null;
       render();
     }));
 
