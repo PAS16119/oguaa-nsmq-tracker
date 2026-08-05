@@ -379,15 +379,19 @@
   }
 
   /* ============================= APP STATE ============================= */
-  let DB = { roster: [], tIndex: [], coachPin: null, meetings: [], assessments: [], weights: {attendance:30, assessment:30, quiz:40} };
+  let DB = { roster: [], tIndex: [], pins: {coach:null, staff:null, scorer:null}, meetings: [], assessments: [], weights: {attendance:30, assessment:30, quiz:40}, notes: {} };
   let currentTournament = null;          // full loaded tournament object
   let ui = {
-    view:'home',            // home | new | tournament | profiles
+    view:'home',            // home | new | tournament | profiles | squad
     tId:null,
     profileFilter:'',
     confirmModal:null,      // {title, body, onConfirm}
-    isCoach:false,          // unlocked edit access (resets on page reload — by design)
+    role:'viewer',          // 'viewer' | 'scorer' | 'staff' | 'coach' — resets on page reload by design
+    isCoach:false,          // true only when role==='coach' — full access
+    isStaff:false,          // true for 'coach' or 'staff' — day-to-day operations
+    isScorer:false,         // true for 'coach','staff','scorer' — can record match results
     pinModal:null,          // {mode:'setup'|'unlock', value:'', error:''}
+    settingsOpen:false,     // whether the coach Settings (PIN management) panel is open
     qualifySelection:null,  // array of cids currently ticked to advance
     qualifySelectionStage:null, // which stage.key the selection belongs to
     editingNameCid:null,    // competitor id currently being renamed
@@ -395,8 +399,15 @@
     openLiveScorerKey:null, // "stageIdx|matchIndex" of the match currently expanded for live scoring
     expandedProfile:null,   // name of student whose contest-analysis panel is expanded
     expandedMeeting:null,   // meeting id currently expanded for attendance entry
-    expandedAssessment:null // assessment id currently expanded for score entry
+    expandedAssessment:null,// assessment id currently expanded for score entry
+    editingNotesFor:null    // student name whose notes textarea is open for editing
   };
+
+  function syncRoleFlags(){
+    ui.isCoach = (ui.role === 'coach');
+    ui.isStaff = (ui.role === 'coach' || ui.role === 'staff');
+    ui.isScorer = (ui.role === 'coach' || ui.role === 'staff' || ui.role === 'scorer');
+  }
 
   function uid(prefix){ return prefix+'_'+Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
 
@@ -605,6 +616,10 @@
     const c = (t.competitors||[]).find(x=>x.id===cid);
     return c ? c.name : '(unknown)';
   }
+  function isGuestCompetitor(t, cid){
+    const c = (t.competitors||[]).find(x=>x.id===cid);
+    return !!(c && c.type==='guest');
+  }
   function competitorMembers(t, cid){
     const c = (t.competitors||[]).find(x=>x.id===cid);
     return c && c.memberNames ? c.memberNames : null;
@@ -692,31 +707,73 @@
   }
 
   function renderCoachLockButton(){
-    if(ui.isCoach){
-      return `<button class="pill gold" data-lock-coach="1" style="cursor:pointer;border:1px solid var(--brass);">🔓 Coach mode</button>`;
+    if(ui.role!=='viewer'){
+      const label = {coach:'Coach', staff:'Staff', scorer:'Scorer'}[ui.role];
+      return `<button class="pill gold" data-lock-coach="1" style="cursor:pointer;border:1px solid var(--brass);">🔓 ${label} mode</button>`;
     }
-    if(!DB.coachPin){
-      return `<button class="pill" data-open-pin="setup" style="cursor:pointer;">🔒 Set coach PIN</button>`;
+    const anyPinSet = DB.pins.coach || DB.pins.staff || DB.pins.scorer;
+    if(!anyPinSet){
+      return `<button class="pill" data-open-pin="setup" style="cursor:pointer;">🔒 Set up access</button>`;
     }
-    return `<button class="pill" data-open-pin="unlock" style="cursor:pointer;">🔒 Student view</button>`;
+    return `<button class="pill" data-open-pin="unlock" style="cursor:pointer;">🔒 Viewer</button>`;
   }
 
   function renderPinModal(){
     const m = ui.pinModal;
     const isSetup = m.mode==='setup';
+    if(isSetup){
+      return `
+      <div class="modal-backdrop" data-pin-backdrop="1">
+        <div class="modal">
+          <h3>Set up access</h3>
+          <p>Set a Coach PIN (full access, required). Staff and Scorer PINs are optional — set them later from Settings if you want to delegate limited access.</p>
+          ${m.error?`<div class="warn-box">${escapeHtml(m.error)}</div>`:''}
+          <label class="field">Coach PIN</label>
+          <input type="text" inputmode="numeric" id="f-pin-coach" placeholder="Required" style="margin-bottom:12px;">
+          <div class="actions">
+            <button class="btn btn-ghost" data-pin-cancel="1">Cancel</button>
+            <button class="btn btn-brass" data-pin-setup-submit="1">Set Coach PIN</button>
+          </div>
+        </div>
+      </div>`;
+    }
     return `
     <div class="modal-backdrop" data-pin-backdrop="1">
       <div class="modal">
-        <h3>${isSetup ? 'Set a coach PIN' : 'Unlock coach mode'}</h3>
-        <p>${isSetup ? 'Anyone with this PIN can edit fixtures and results. Students without it can still view everything — league tables and profiles stay fully visible.' : 'Enter the coach PIN to add tournaments, generate fixtures, and record results.'}</p>
+        <h3>Unlock access</h3>
+        <p>Enter your PIN. The app recognizes which access level it belongs to automatically.</p>
         ${m.error?`<div class="warn-box">${escapeHtml(m.error)}</div>`:''}
         <input type="text" inputmode="numeric" id="f-pin-value" placeholder="Enter PIN" value="${escapeAttr(m.value)}" style="margin-bottom:14px;">
         <div class="actions">
           <button class="btn btn-ghost" data-pin-cancel="1">Cancel</button>
-          <button class="btn btn-brass" data-pin-submit="1">${isSetup?'Set PIN':'Unlock'}</button>
+          <button class="btn btn-brass" data-pin-submit="1">Unlock</button>
         </div>
       </div>
     </div>`;
+  }
+
+  function renderSettingsPanel(){
+    const p = DB.pins;
+    let html = `<div class="card">
+      <div class="flex-between"><h2>Settings — Access PINs</h2><button class="btn btn-sm btn-ghost" data-close-settings="1">✕ Close</button></div>
+      <p class="sub">Coach: full access. Staff: day-to-day operations (tournaments, fixtures, squad, scoring) but can't delete data or manage PINs. Scorer: can only record match results — nothing else.</p>
+      <div class="row" style="margin-bottom:12px;">
+        <div><label class="field">Coach PIN ${p.coach?'(set)':'(not set)'}</label><input type="text" inputmode="numeric" id="f-settings-coach" placeholder="New coach PIN"></div>
+        <div style="flex:0;"><button class="btn btn-sm" data-save-pin="coach">Save</button></div>
+      </div>
+      <div class="row" style="margin-bottom:12px;">
+        <div><label class="field">Staff PIN ${p.staff?'(set)':'(not set)'}</label><input type="text" inputmode="numeric" id="f-settings-staff" placeholder="New staff PIN"></div>
+        <div style="flex:0;"><button class="btn btn-sm" data-save-pin="staff">Save</button></div>
+        ${p.staff?`<div style="flex:0;"><button class="btn btn-sm btn-danger" data-clear-pin="staff">Remove</button></div>`:''}
+      </div>
+      <div class="row">
+        <div><label class="field">Scorer PIN ${p.scorer?'(set)':'(not set)'}</label><input type="text" inputmode="numeric" id="f-settings-scorer" placeholder="New scorer PIN"></div>
+        <div style="flex:0;"><button class="btn btn-sm" data-save-pin="scorer">Save</button></div>
+        ${p.scorer?`<div style="flex:0;"><button class="btn btn-sm btn-danger" data-clear-pin="scorer">Remove</button></div>`:''}
+      </div>
+      <p class="small-note">Saving a PIN here immediately replaces the old one — share the new PIN with whoever needs that access level.</p>
+    </div>`;
+    return html;
   }
 
   function renderModal(m){
@@ -741,7 +798,7 @@
           <h2 class="display" style="font-size:22px;margin:0;">Tournaments</h2>
           <p class="sub" style="margin:4px 0 0;">Every ballot, every round, tracked in one place.</p>
         </div>
-        ${ui.isCoach ? `<button class="btn btn-brass" data-nav="new">+ New tournament</button>` : `<span class="pill">Student view — ask your coach to unlock editing</span>`}
+        ${ui.isStaff ? `<button class="btn btn-brass" data-nav="new">+ New tournament</button>` : `<span class="pill">Viewer — ask your coach or staff lead to unlock editing</span>`}
       </div>`;
 
     if(DB.tIndex.length>0){
@@ -775,10 +832,14 @@
     if(ui.isCoach){
       html += `<div class="divider"></div>
         <div class="card">
-          <h2>Data</h2>
+          <div class="flex-between">
+            <h2>Data &amp; access</h2>
+            <button class="btn btn-sm ${ui.settingsOpen?'btn-brass':'btn-ghost'}" data-toggle-settings="1">${ui.settingsOpen?'▾ Hide':'⚙ Settings'}</button>
+          </div>
           <p class="sub">This data is shared — anyone who opens this tracker sees the same tournaments and results.</p>
           <button class="btn btn-danger btn-sm" data-reset-all="1">Reset everything</button>
         </div>`;
+      if(ui.settingsOpen) html += renderSettingsPanel();
     }
     return html;
   }
@@ -786,13 +847,13 @@
   /* ============================= NEW TOURNAMENT ============================= */
   let newTForm = null;
   function freshNewTForm(){
-    return { name:'', matchFormat:'individual', names:[], nameInput:'', teamA:'', teamB:'', teams:[], seedIds:[] , gamesPerCompetitor:3};
+    return { name:'', matchFormat:'individual', names:[], nameInput:'', teamA:'', teamB:'', teams:[], seedIds:[], gamesPerCompetitor:3, guests:[], guestNameInput:'', guestSeedIds:[] };
   }
   function renderNewTournament(){
-    if(!ui.isCoach){
+    if(!ui.isStaff){
       return `<a class="link-btn" data-nav="home">← Back to tournaments</a>
-        <div class="empty card"><div class="display">Coach mode required</div>
-        <p>Ask your coach to unlock editing to set up a new tournament.</p></div>`;
+        <div class="empty card"><div class="display">Staff access required</div>
+        <p>Ask your coach to unlock staff or coach access to set up a new tournament.</p></div>`;
     }
     if(!newTForm) newTForm = freshNewTForm();
     const f = newTForm;
@@ -860,6 +921,26 @@
     }
 
     html += `<div class="card">
+      <h2>Guest schools <span class="pill">for friendlies &amp; trials</span></h2>
+      <p class="sub">Invited a visiting school for a trial match? Add them here as a guest slot — they'll compete in the fixture like anyone else, but won't be tracked individually in Student Profiles or the Squad report, since we're not scoring their internal students.</p>
+      <div class="row">
+        <div><input type="text" id="f-guestinput" placeholder="Guest school / team name (e.g. Mfantsipim School)" value="${escapeAttr(f.guestNameInput)}"></div>
+        <div style="flex:0;"><button class="btn" data-add-guest="1">Add guest</button></div>
+      </div>
+      <div style="margin-top:12px;">`;
+    f.guests.forEach((n,i)=>{
+      const seeded = f.guestSeedIds.includes(i);
+      html += `<span class="name-chip">🏫 ${seeded?'★ ':''}${escapeHtml(n)}
+        <span class="tag-remove" data-remove-guest="${i}">✕</span></span>`;
+    });
+    html += `</div>
+      <div class="small-note">${f.guests.length} guest slot${f.guests.length!==1?'s':''} added</div>
+      ${f.guests.length>0?`<div class="divider"></div><label class="field">Mark strong / seeded guests (tap to toggle)</label><div>`+
+        f.guests.map((n,i)=>`<button type="button" class="pill ${f.guestSeedIds.includes(i)?'gold':''}" data-toggle-guest-seed="${i}">${f.guestSeedIds.includes(i)?'★ ':''}🏫 ${escapeHtml(n)}</button>`).join(' ')
+      +`</div>`:''}
+    </div>`;
+
+    html += `<div class="card">
         <h2>Prelim games per competitor</h2>
         <div class="row">
           <div style="max-width:140px;">
@@ -904,7 +985,7 @@
       html += `<div class="ok-box">Viewing "${escapeHtml(stage.label)}" (completed) — read-only. Tap "${escapeHtml(t.stages[t.currentStageIndex].label)}" above to get back to the live stage.</div>`;
     }
 
-    if(ui.isCoach && isCurrent && t.stages.length>1 && !t.champion){
+    if(ui.isStaff && isCurrent && t.stages.length>1 && !t.champion){
       html += `<div style="margin-bottom:14px;"><a class="link-btn" data-undo-advance="1">← Undo advance, go back to "${escapeHtml(t.stages[stageIdx-1].label)}"</a></div>`;
     }
 
@@ -912,7 +993,7 @@
       html += `<div class="card" style="text-align:center; border-color:var(--brass);">
         <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;">Champion</div>
         <div class="display" style="font-size:28px;color:var(--brass-soft);margin-top:6px;">🏆 ${escapeHtml(competitorName(t, t.champion))}</div>
-        ${ui.isCoach?`<a class="link-btn" data-undo-champion="1" style="display:inline-block;margin-top:8px;">Undo this</a>`:''}
+        ${ui.isStaff?`<a class="link-btn" data-undo-champion="1" style="display:inline-block;margin-top:8px;">Undo this</a>`:''}
       </div>`;
     }
 
@@ -921,7 +1002,8 @@
   }
 
   function renderStagePanel(t, stage, stageIdx, isCurrent){
-    const canEdit = ui.isCoach && isCurrent;
+    const canEdit = ui.isStaff && isCurrent;   // fixture setup, competitor edits, stage progression
+    const canScore = ui.isScorer && isCurrent; // recording match results only
     let html = `<div class="card">
       <div class="flex-between">
         <div>
@@ -934,7 +1016,7 @@
       // Fixture not generated yet
       html += `<div class="divider"></div>`;
       if(!canEdit){
-        html += `<p class="small-note">Fixture hasn't been generated yet — check back once your coach sets it up.</p>`;
+        html += `<p class="small-note">Fixture hasn't been generated yet — check back once your coach or staff lead sets it up.</p>`;
       } else {
         if(stageIdx===0) html += renderCompetitorEditPanel(t, stage);
         if(stage.competitorIds.length===3){
@@ -952,8 +1034,9 @@
         }
       }
     } else {
-      if(canEdit){
-        const anyCompleted = stage.matches.some(m=>m.completed);
+      const anyCompleted = stage.matches.some(m=>m.completed);
+      const canResetThis = anyCompleted ? ui.isCoach : canEdit;
+      if(canResetThis){
         html += `<div class="divider"></div>
           <button class="btn btn-sm btn-ghost" data-reset-fixture="${stageIdx}">↺ ${anyCompleted?'Reset fixture (clears recorded results)':'Regenerate fixture'}</button>`;
       }
@@ -966,7 +1049,7 @@
       let matchCounter = 0;
       stage.matches.forEach((m)=>{
         matchCounter++;
-        html += renderMatchTicket(t, stage, stageIdx, m, matchCounter, canEdit);
+        html += renderMatchTicket(t, stage, stageIdx, m, matchCounter, canEdit, canScore);
       });
 
       html += `<div class="divider"></div><h3 class="display" style="font-size:15px;margin:0 0 10px;">Standings</h3>`;
@@ -998,7 +1081,7 @@
       } else {
         html += `<span class="name-chip">
           <button type="button" data-edit-toggle-seed="${c.id}" style="background:none;border:none;color:${c.seed?'var(--brass-soft)':'var(--muted)'};cursor:pointer;padding:0;margin-right:4px;font-size:13px;">${c.seed?'★':'☆'}</button>
-          ${escapeHtml(c.name)}
+          ${c.type==='guest'?'🏫 ':''}${escapeHtml(c.name)}
           <button type="button" data-start-rename="${c.id}" style="background:none;border:none;color:var(--muted);cursor:pointer;padding:0;margin-left:5px;font-size:11px;">✏️</button>
           <span class="tag-remove" data-edit-remove-competitor="${c.id}">✕</span>
         </span>`;
@@ -1009,9 +1092,13 @@
         <div><input type="text" id="f-edit-add-name" placeholder="Add another contestant…"></div>
         <div style="flex:0;"><button class="btn btn-sm" data-edit-add-competitor="1">Add</button></div>
       </div>
+      <div class="row" style="margin-top:8px;">
+        <div><input type="text" id="f-edit-add-guest" placeholder="Add a guest school (friendly/trial)…"></div>
+        <div style="flex:0;"><button class="btn btn-sm" data-edit-add-guest="1">Add guest</button></div>
+      </div>
       ${!slotsOk?`<div class="warn-box" style="margin-top:10px;">${n} competitors × ${g} games = ${n*g} slots, not divisible by 3. Add/remove a contestant or change games-per-competitor before generating.</div>`:''}
       ${seedCount>maxSeeds?`<div class="warn-box" style="margin-top:10px;">Too many seeds marked — untap ${seedCount-maxSeeds} of them (★ toggles it off) before generating.</div>`:''}
-      <p class="small-note">Tap the star to mark/unmark a strong contestant. You can keep editing this list until you generate the fixture below.</p>
+      <p class="small-note">Tap the star to mark/unmark a strong contestant. Guest schools (🏫) compete normally in the fixture but aren't tracked in Student Profiles or Squad reports.</p>
     </div>`;
     return html;
   }
@@ -1038,7 +1125,7 @@
     return html;
   }
 
-  function renderMatchTicket(t, stage, stageIdx, m, num, canEdit){
+  function renderMatchTicket(t, stage, stageIdx, m, num, canEdit, canScore){
     const mi = stage.matches.indexOf(m);
     const key = stageIdx+'|'+mi;
     const isOpen = ui.openLiveScorerKey === key;
@@ -1047,25 +1134,26 @@
     let html = `<div class="match-ticket">
       <div class="m-head">
         <span class="m-label">Match ${num}${m.completed?' · <span class="completed-tag">Recorded</span>':''}</span>
-        ${canEdit ? `<button type="button" class="btn btn-sm ${isOpen?'btn-brass':'btn-ghost'} no-print" data-toggle-live-scorer="${key}">${isOpen?'▾ Hide scorer':'▸ '+(m.completed?'Edit score':'Score live')}</button>` : ''}
+        ${canScore ? `<button type="button" class="btn btn-sm ${isOpen?'btn-brass':'btn-ghost'} no-print" data-toggle-live-scorer="${key}">${isOpen?'▾ Hide scorer':'▸ '+(m.completed?'Edit score':'Score live')}</button>` : ''}
       </div>
       <div class="m-players">`;
 
     m.slots.forEach((cid, slotIdx)=>{
       const isSeed = (t.competitors.find(c=>c.id===cid)||{}).seed;
+      const isGuest = isGuestCompetitor(t, cid);
       const result = m.results && m.results[cid] ? m.results[cid] : null;
       const rankText = result && result.rank ? (result.tied?'T-':'')+rankLabel[result.rank] : '';
       if(canEdit && !m.completed){
         html += `<div class="m-player-row">
-          <span class="print-only-name">${escapeHtml(competitorName(t,cid))}${isSeed?' ★':''}</span>
+          <span class="print-only-name">${isGuest?'🏫 ':''}${escapeHtml(competitorName(t,cid))}${isSeed?' ★':''}</span>
           <select data-slot-edit="${mi}|${slotIdx}">
-            ${stage.competitorIds.map(oc=>`<option value="${oc}" ${oc===cid?'selected':''}>${escapeHtml(competitorName(t,oc))}</option>`).join('')}
+            ${stage.competitorIds.map(oc=>`<option value="${oc}" ${oc===cid?'selected':''}>${isGuestCompetitor(t,oc)?'🏫 ':''}${escapeHtml(competitorName(t,oc))}</option>`).join('')}
           </select>
           <span class="pill">Pending</span>
         </div>`;
       } else {
         html += `<div class="m-player-row">
-          <span class="name">${escapeHtml(competitorName(t,cid))}${isSeed?'<span class="seed-star">★</span>':''}</span>
+          <span class="name">${isGuest?'🏫 ':''}${escapeHtml(competitorName(t,cid))}${isSeed?'<span class="seed-star">★</span>':''}</span>
           ${m.completed ? `<span class="pill gold">${rankText}${result&&result.score!==undefined?' · '+result.score+' pts':''}</span>` : `<span class="pill">Pending</span>`}
         </div>`;
       }
@@ -1276,7 +1364,7 @@
       html += `<tr>
         ${showQualifyCheckboxes?`<td><input type="checkbox" data-qualify-check="${s.cid}" ${checked?'checked':''}></td>`:''}
         <td class="rank-num">${i+1}</td>
-        <td>${escapeHtml(competitorName(t,s.cid))}${isSeed?'<span class="seed-star">★</span>':''}</td>
+        <td>${isGuestCompetitor(t,s.cid)?'🏫 ':''}${escapeHtml(competitorName(t,s.cid))}${isSeed?'<span class="seed-star">★</span>':''}</td>
         <td>${s.played}/${stage.gamesPerCompetitor}</td>
         <td class="mono">${s.pts}</td>
         <td class="mono">${s.score}</td>
@@ -1291,8 +1379,8 @@
 
     if(!canEdit && allComplete && stage.qualifiedIds){
       html += `<div class="divider"></div><p class="small-note">This stage is resolved — ${stage.qualifiedIds.length} qualified through to the next stage.</p>`;
-    } else if(allComplete && !ui.isCoach){
-      html += `<div class="divider"></div><p class="small-note">All matches in — ask your coach to advance the tournament to the next stage.</p>`;
+    } else if(allComplete && !canEdit){
+      html += `<div class="divider"></div><p class="small-note">All matches in — ask your coach or staff lead to advance the tournament to the next stage.</p>`;
     }
     if(allComplete && canEdit){
       if(isFinalDecider){
@@ -1472,7 +1560,7 @@
             const r = m.results && m.results[cid];
             if(!r) return;
             const comp = (t.competitors||[]).find(c=>c.id===cid);
-            if(!comp) return;
+            if(!comp || comp.type==='guest') return;
             const names = comp.memberNames && comp.memberNames.length ? comp.memberNames : [comp.name];
             names.forEach(nm=>{
               const p = ensure(nm);
@@ -1513,7 +1601,7 @@
           const cidNames = {};
           m.slots.forEach(cid=>{
             const comp = (t.competitors||[]).find(c=>c.id===cid);
-            if(comp) cidNames[cid] = comp.memberNames && comp.memberNames.length ? comp.memberNames : [comp.name];
+            if(comp && comp.type!=='guest') cidNames[cid] = comp.memberNames && comp.memberNames.length ? comp.memberNames : [comp.name];
           });
           function credit(cid, subject, pts, isCorrect, roundKey){
             const names = cidNames[cid]; if(!names) return;
@@ -1630,7 +1718,7 @@
     let html = `<div class="card">
       <h2>Selection weights</h2>
       <p class="sub">How attendance, assessments, and quiz performance combine into the aggregate score below. A student missing one category (e.g. no assessments yet) is scored on the remaining categories only.</p>`;
-    if(ui.isCoach){
+    if(ui.isStaff){
       html += `<div class="row">
         <div><label class="field">Attendance</label><input type="number" min="0" id="f-weight-attendance" value="${w.attendance}"></div>
         <div><label class="field">Assessments</label><input type="number" min="0" id="f-weight-assessment" value="${w.assessment}"></div>
@@ -1675,7 +1763,7 @@
       });
       html += `</tbody></table>`;
     }
-    if(ui.isCoach){
+    if(ui.isStaff){
       html += `<div class="divider"></div>
         <div class="row">
           <div><input type="text" id="f-roster-add" placeholder="Add a student to the squad roster…"></div>
@@ -1689,7 +1777,7 @@
   function renderMeetingsSection(){
     let html = `<div class="card">
       <h2>Meetings &amp; attendance</h2>`;
-    if(ui.isCoach){
+    if(ui.isStaff){
       html += `<div class="row">
         <div><input type="text" id="f-meeting-name" placeholder="Meeting name (e.g. Tuesday training)"></div>
         <div><input type="date" id="f-meeting-date"></div>
@@ -1714,7 +1802,7 @@
         DB.roster.slice().sort().forEach(name=>{
           const present = !!(mt.attendance && mt.attendance[name]);
           html += `<label class="checkbox-row" style="margin-bottom:8px;">
-            <input type="checkbox" data-meeting-attendance="${mt.id}|${escapeAttr(name)}" ${present?'checked':''} ${ui.isCoach?'':'disabled'}>
+            <input type="checkbox" data-meeting-attendance="${mt.id}|${escapeAttr(name)}" ${present?'checked':''} ${ui.isStaff?'':'disabled'}>
             ${escapeHtml(name)}
           </label>`;
         });
@@ -1731,7 +1819,7 @@
   function renderAssessmentsSection(){
     let html = `<div class="card">
       <h2>Assessments &amp; exams</h2>`;
-    if(ui.isCoach){
+    if(ui.isStaff){
       html += `<div class="row">
         <div><input type="text" id="f-assessment-name" placeholder="Test name (e.g. Biology Mock 1)"></div>
         <div><label class="field">Max score</label><input type="number" id="f-assessment-max" min="1" value="100"></div>
@@ -1757,7 +1845,7 @@
           const val = as.scores ? as.scores[name] : undefined;
           html += `<div class="row" style="margin-bottom:8px; align-items:center;">
             <div style="flex:2;">${escapeHtml(name)}</div>
-            <div style="max-width:100px;"><input type="number" min="0" max="${as.maxScore}" step="any" data-assessment-score="${as.id}|${escapeAttr(name)}" value="${val!==undefined?val:''}" ${ui.isCoach?'':'disabled'}></div>
+            <div style="max-width:100px;"><input type="number" min="0" max="${as.maxScore}" step="any" data-assessment-score="${as.id}|${escapeAttr(name)}" value="${val!==undefined?val:''}" ${ui.isStaff?'':'disabled'}></div>
           </div>`;
         });
         if(ui.isCoach){
@@ -1829,6 +1917,26 @@
       render();
     }));
 
+    const guestInputEl = q('#f-guestinput');
+    if(guestInputEl){
+      guestInputEl.addEventListener('input', e=>{ newTForm.guestNameInput = e.target.value; });
+      guestInputEl.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); addGuestToForm(); } });
+    }
+    const addGuestBtn = q('[data-add-guest]');
+    if(addGuestBtn) addGuestBtn.addEventListener('click', addGuestToForm);
+    qa('[data-remove-guest]').forEach(el=>el.addEventListener('click', ()=>{
+      const i = parseInt(el.getAttribute('data-remove-guest'));
+      newTForm.guests.splice(i,1);
+      newTForm.guestSeedIds = newTForm.guestSeedIds.filter(x=>x!==i).map(x=>x>i?x-1:x);
+      render();
+    }));
+    qa('[data-toggle-guest-seed]').forEach(el=>el.addEventListener('click', ()=>{
+      const i = parseInt(el.getAttribute('data-toggle-guest-seed'));
+      const idx = newTForm.guestSeedIds.indexOf(i);
+      if(idx>=0) newTForm.guestSeedIds.splice(idx,1); else newTForm.guestSeedIds.push(i);
+      render();
+    }));
+
     const createBtn = q('[data-create-tournament]');
     if(createBtn) createBtn.addEventListener('click', createTournamentFromForm);
 
@@ -1896,6 +2004,10 @@
     if(editAddBtn) editAddBtn.addEventListener('click', addCompetitorToSetup);
     const editAddInput = q('#f-edit-add-name');
     if(editAddInput) editAddInput.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); addCompetitorToSetup(); } });
+    const editAddGuestBtn = q('[data-edit-add-guest]');
+    if(editAddGuestBtn) editAddGuestBtn.addEventListener('click', addGuestCompetitorToSetup);
+    const editAddGuestInput = q('#f-edit-add-guest');
+    if(editAddGuestInput) editAddGuestInput.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); addGuestCompetitorToSetup(); } });
     qa('[data-reset-fixture]').forEach(el=>el.addEventListener('click', ()=>{
       resetFixtureForStage(parseInt(el.getAttribute('data-reset-fixture')));
     }));
@@ -2104,7 +2216,7 @@
       render();
     }));
 
-    // Coach PIN controls
+    // Access PIN controls
     const openPinBtn = q('[data-open-pin]');
     if(openPinBtn) openPinBtn.addEventListener('click', ()=>{
       ui.pinModal = { mode: openPinBtn.getAttribute('data-open-pin'), value:'', error:'' };
@@ -2112,7 +2224,9 @@
     });
     const lockBtn = q('[data-lock-coach]');
     if(lockBtn) lockBtn.addEventListener('click', ()=>{
-      ui.isCoach = false;
+      ui.role = 'viewer';
+      syncRoleFlags();
+      ui.settingsOpen = false;
       if(ui.view==='new') ui.view='home';
       render();
     });
@@ -2121,34 +2235,80 @@
       pinValEl.addEventListener('input', e=>{ ui.pinModal.value = e.target.value; });
       pinValEl.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); submitPinModal(); } });
     }
+    const pinCoachSetupEl = q('#f-pin-coach');
+    if(pinCoachSetupEl) pinCoachSetupEl.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); submitPinSetup(); } });
     const pinCancel = q('[data-pin-cancel]');
     if(pinCancel) pinCancel.addEventListener('click', ()=>{ ui.pinModal=null; render(); });
     const pinSubmit = q('[data-pin-submit]');
     if(pinSubmit) pinSubmit.addEventListener('click', submitPinModal);
+    const pinSetupSubmit = q('[data-pin-setup-submit]');
+    if(pinSetupSubmit) pinSetupSubmit.addEventListener('click', submitPinSetup);
     const pinBackdrop = q('[data-pin-backdrop]');
     if(pinBackdrop) pinBackdrop.addEventListener('click', e=>{ if(e.target===pinBackdrop){ ui.pinModal=null; render(); } });
+
+    // Settings panel
+    const toggleSettingsBtn = q('[data-toggle-settings]');
+    if(toggleSettingsBtn) toggleSettingsBtn.addEventListener('click', ()=>{ ui.settingsOpen = !ui.settingsOpen; render(); });
+    const closeSettingsBtn = q('[data-close-settings]');
+    if(closeSettingsBtn) closeSettingsBtn.addEventListener('click', ()=>{ ui.settingsOpen = false; render(); });
+    qa('[data-save-pin]').forEach(el=>el.addEventListener('click', ()=>{
+      savePinForRole(el.getAttribute('data-save-pin'));
+    }));
+    qa('[data-clear-pin]').forEach(el=>el.addEventListener('click', ()=>{
+      const role = el.getAttribute('data-clear-pin');
+      openConfirm(`Remove ${role} PIN?`, `Anyone using the ${role} PIN will lose that access until you set a new one.`, ()=>clearPinForRole(role));
+    }));
+  }
+
+  async function submitPinSetup(){
+    const m = ui.pinModal;
+    const el = q('#f-pin-coach');
+    const val = (el ? el.value : '').trim();
+    if(!val){ m.error = 'Enter a Coach PIN first.'; render(); return; }
+    DB.pins.coach = val;
+    await sSet('access_pins', DB.pins);
+    ui.role = 'coach';
+    syncRoleFlags();
+    ui.pinModal = null;
+    render();
   }
 
   async function submitPinModal(){
     const m = ui.pinModal;
     const val = (m.value||'').trim();
     if(!val){ m.error = 'Enter a PIN first.'; render(); return; }
-    if(m.mode==='setup'){
-      DB.coachPin = val;
-      await sSet('coach_pin', val);
-      ui.isCoach = true;
+    let matched = null;
+    if(DB.pins.coach && val===DB.pins.coach) matched='coach';
+    else if(DB.pins.staff && val===DB.pins.staff) matched='staff';
+    else if(DB.pins.scorer && val===DB.pins.scorer) matched='scorer';
+    if(matched){
+      ui.role = matched;
+      syncRoleFlags();
       ui.pinModal = null;
       render();
     } else {
-      if(val === DB.coachPin){
-        ui.isCoach = true;
-        ui.pinModal = null;
-        render();
-      } else {
-        m.error = 'That PIN is not right — try again.';
-        render();
-      }
+      m.error = 'That PIN is not recognized — try again.';
+      render();
     }
+  }
+
+  async function savePinForRole(role){
+    if(!ui.isCoach) return;
+    const el = q(`#f-settings-${role}`);
+    const val = (el ? el.value : '').trim();
+    if(!val){ toast('Enter a PIN first.', 'error'); return; }
+    DB.pins[role] = val;
+    await sSet('access_pins', DB.pins);
+    toast(`${role[0].toUpperCase()+role.slice(1)} PIN saved.`, 'success');
+    render();
+  }
+
+  async function clearPinForRole(role){
+    if(!ui.isCoach) return;
+    DB.pins[role] = null;
+    await sSet('access_pins', DB.pins);
+    toast(`${role[0].toUpperCase()+role.slice(1)} PIN removed.`, 'success');
+    render();
   }
 
   function q(sel){ return appEl.querySelector(sel); }
@@ -2160,19 +2320,26 @@
     if(v){ newTForm.names.push(v); newTForm.nameInput=''; render(); }
   }
 
+  function addGuestToForm(){
+    const v = (newTForm.guestNameInput||'').trim();
+    if(v){ newTForm.guests.push(v); newTForm.guestNameInput=''; render(); }
+  }
+
   /* ============================= ACTIONS ============================= */
   async function createTournamentFromForm(){
-    if(!ui.isCoach){ alert('Coach mode is required to create a tournament.'); return; }
+    if(!ui.isStaff){ alert('Staff or coach access is required to create a tournament.'); return; }
     const f = newTForm;
     const name = (f.name||'').trim() || 'Untitled tournament';
     let competitors = [];
     if(f.matchFormat==='individual'){
-      competitors = f.names.map((n,i)=>({id:uid('c'), name:n, seed:f.seedIds.includes(i)}));
+      competitors = f.names.map((n,i)=>({id:uid('c'), name:n, seed:f.seedIds.includes(i), type:'individual'}));
     } else {
-      competitors = f.teams.map((tm,i)=>({id:uid('c'), name:tm[0]+' & '+tm[1], memberNames:tm, seed:f.seedIds.includes(i)}));
+      competitors = f.teams.map((tm,i)=>({id:uid('c'), name:tm[0]+' & '+tm[1], memberNames:tm, seed:f.seedIds.includes(i), type:'team'}));
     }
+    const guestCompetitors = f.guests.map((n,i)=>({id:uid('c'), name:n, seed:f.guestSeedIds.includes(i), type:'guest'}));
+    competitors = competitors.concat(guestCompetitors);
     if(competitors.length<3){
-      alert('Add at least 3 competitors (or teams) before creating the tournament.');
+      alert('Add at least 3 competitors (or teams/guests) before creating the tournament.');
       return;
     }
     const t = {
@@ -2206,6 +2373,7 @@
   async function refreshRosterFromCompetitors(competitors){
     const names = new Set(DB.roster);
     competitors.forEach(c=>{
+      if(c.type==='guest') return; // guest schools aren't tracked individually
       if(c.memberNames) c.memberNames.forEach(n=>names.add(n));
       else names.add(c.name);
     });
@@ -2226,13 +2394,13 @@
   }
 
   async function toggleCompetitorSeed(cid){
-    if(!ui.isCoach) return;
+    if(!ui.isStaff) return;
     const c = currentTournament.competitors.find(x=>x.id===cid);
     if(c){ c.seed = !c.seed; await saveCurrentTournament(); render(); }
   }
 
   async function saveRename(cid){
-    if(!ui.isCoach) return;
+    if(!ui.isStaff) return;
     const input = q(`#f-rename-${cid}`);
     const name = (input ? input.value : '').trim();
     if(!name){ toast('Name cannot be empty.', 'error'); return; }
@@ -2246,7 +2414,7 @@
   }
 
   async function removeCompetitorFromSetup(cid){
-    if(!ui.isCoach) return;
+    if(!ui.isStaff) return;
     const t = currentTournament;
     if(t.competitors.length<=3){ alert('A tournament needs at least 3 competitors.'); return; }
     t.competitors = t.competitors.filter(c=>c.id!==cid);
@@ -2256,12 +2424,12 @@
   }
 
   async function addCompetitorToSetup(){
-    if(!ui.isCoach) return;
+    if(!ui.isStaff) return;
     const input = q('#f-edit-add-name');
     const name = (input ? input.value : '').trim();
     if(!name) return;
     const t = currentTournament;
-    const newC = { id: uid('c'), name, seed:false };
+    const newC = { id: uid('c'), name, seed:false, type:'individual' };
     t.competitors.push(newC);
     t.stages[0].competitorIds.push(newC.id);
     await refreshRosterFromCompetitors([newC]);
@@ -2269,10 +2437,25 @@
     render();
   }
 
+  async function addGuestCompetitorToSetup(){
+    if(!ui.isStaff) return;
+    const input = q('#f-edit-add-guest');
+    const name = (input ? input.value : '').trim();
+    if(!name) return;
+    const t = currentTournament;
+    const newC = { id: uid('c'), name, seed:false, type:'guest' };
+    t.competitors.push(newC);
+    t.stages[0].competitorIds.push(newC.id);
+    // guests are not added to the roster — not tracked individually
+    await saveCurrentTournament();
+    render();
+  }
+
   async function resetFixtureForStage(stageIdx){
-    if(!ui.isCoach) return;
     const stage = currentTournament.stages[stageIdx];
     const anyCompleted = stage.matches.some(m=>m.completed);
+    const allowed = anyCompleted ? ui.isCoach : ui.isStaff;
+    if(!allowed){ toast(anyCompleted ? 'Coach access is required to clear recorded results.' : 'Staff or coach access is required.', 'error'); return; }
     openConfirm(
       'Reset this fixture?',
       anyCompleted
@@ -2335,7 +2518,7 @@
   }
 
   async function saveWeights(){
-    if(!ui.isCoach) return;
+    if(!ui.isStaff) return;
     const a = parseFloat((q('#f-weight-attendance')||{}).value)||0;
     const s = parseFloat((q('#f-weight-assessment')||{}).value)||0;
     const qz = parseFloat((q('#f-weight-quiz')||{}).value)||0;
@@ -2346,7 +2529,7 @@
   }
 
   async function addToRoster(){
-    if(!ui.isCoach) return;
+    if(!ui.isStaff) return;
     const el = q('#f-roster-add');
     const name = (el ? el.value : '').trim();
     if(!name) return;
@@ -2360,7 +2543,7 @@
   }
 
   async function addMeeting(){
-    if(!ui.isCoach) return;
+    if(!ui.isStaff) return;
     const nameEl = q('#f-meeting-name');
     const dateEl = q('#f-meeting-date');
     const name = (nameEl ? nameEl.value : '').trim();
@@ -2376,7 +2559,7 @@
   }
 
   async function toggleAttendance(meetingId, name, checked){
-    if(!ui.isCoach) return;
+    if(!ui.isStaff) return;
     const mt = DB.meetings.find(m=>m.id===meetingId);
     if(!mt) return;
     if(!mt.attendance) mt.attendance = {};
@@ -2393,7 +2576,7 @@
   }
 
   async function addAssessment(){
-    if(!ui.isCoach) return;
+    if(!ui.isStaff) return;
     const nameEl = q('#f-assessment-name');
     const maxEl = q('#f-assessment-max');
     const dateEl = q('#f-assessment-date');
@@ -2409,7 +2592,7 @@
   }
 
   async function saveAssessmentScore(asId, name, value){
-    if(!ui.isCoach) return;
+    if(!ui.isStaff) return;
     const as = DB.assessments.find(a=>a.id===asId);
     if(!as) return;
     if(!as.scores) as.scores = {};
@@ -2427,7 +2610,7 @@
   }
 
   async function generateFixtureForStage(stageIdx, mode){
-    if(!ui.isCoach){ alert('Coach mode is required to generate a fixture.'); return; }
+    if(!ui.isStaff){ alert('Staff or coach access is required to generate a fixture.'); return; }
     const t = currentTournament;
     const stage = t.stages[stageIdx];
     const seedIds = mode==='norepeat' ? stage.competitorIds.filter(cid=>{
@@ -2461,7 +2644,7 @@
   }
 
   async function generateFinalFixture(stageIdx, gamesCount){
-    if(!ui.isCoach){ alert('Coach mode is required to generate a fixture.'); return; }
+    if(!ui.isStaff){ alert('Staff or coach access is required to generate a fixture.'); return; }
     const t = currentTournament;
     const stage = t.stages[stageIdx];
     stage.gamesPerCompetitor = gamesCount;
@@ -2474,7 +2657,7 @@
   }
 
   async function finishLiveMatch(mi){
-    if(!ui.isCoach){ alert('Coach mode is required.'); return; }
+    if(!ui.isScorer){ alert('Scorer, staff, or coach access is required.'); return; }
     const t = currentTournament;
     const stage = t.stages[t.currentStageIndex];
     const m = stage.matches[mi];
@@ -2490,7 +2673,7 @@
   }
 
   async function advanceStage(){
-    if(!ui.isCoach){ alert('Coach mode is required.'); return; }
+    if(!ui.isStaff){ alert('Staff or coach access is required.'); return; }
     const t = currentTournament;
     const stage = t.stages[t.currentStageIndex];
     const labelEl = q('#f-next-label');
@@ -2519,7 +2702,7 @@
   }
 
   async function declareChampion(){
-    if(!ui.isCoach){ alert('Coach mode is required.'); return; }
+    if(!ui.isStaff){ alert('Staff or coach access is required.'); return; }
     const pickEl = q('#f-champion-pick');
     if(!pickEl) return;
     currentTournament.champion = pickEl.value;
@@ -2535,16 +2718,26 @@
   async function init(){
     const roster = await sGet('roster');
     const tIndex = await sGet('tournament_index');
-    const coachPin = await sGet('coach_pin');
+    const accessPins = await sGet('access_pins');
+    const legacyCoachPin = await sGet('coach_pin'); // migrate from the old single-PIN system
     const meetings = await sGet('meetings');
     const assessments = await sGet('assessments');
     const weights = await sGet('selection_weights');
+    const notes = await sGet('student_notes');
     DB.roster = roster || [];
     DB.tIndex = tIndex || [];
-    DB.coachPin = coachPin || null;
     DB.meetings = meetings || [];
     DB.assessments = assessments || [];
     DB.weights = weights || {attendance:30, assessment:30, quiz:40};
+    DB.notes = notes || {};
+    if(accessPins){
+      DB.pins = accessPins;
+    } else if(legacyCoachPin){
+      DB.pins = {coach: legacyCoachPin, staff:null, scorer:null};
+      await sSet('access_pins', DB.pins); // one-time migration
+    } else {
+      DB.pins = {coach:null, staff:null, scorer:null};
+    }
     DB.fullCache = [];
     // preload all tournament blobs for profile aggregation
     for(const summary of DB.tIndex){
