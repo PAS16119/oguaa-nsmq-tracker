@@ -379,7 +379,8 @@
   }
 
   /* ============================= APP STATE ============================= */
-  let DB = { roster: [], tIndex: [], pins: {coach:null, staff:null, scorer:null}, meetings: [], assessments: [], weights: {attendance:30, assessment:30, quiz:40}, notes: {} };
+  let DB = { students: [], tIndex: [], pins: {coach:null, staff:null, scorer:null}, meetings: [], assessments: [], weights: {attendance:30, assessment:30, quiz:40}, notes: {} };
+  function studentNames(){ return DB.students.map(s=>s.name); }
   let currentTournament = null;          // full loaded tournament object
   let ui = {
     view:'home',            // home | new | tournament | profiles | squad
@@ -400,7 +401,9 @@
     expandedProfile:null,   // name of student whose contest-analysis panel is expanded
     expandedMeeting:null,   // meeting id currently expanded for attendance entry
     expandedAssessment:null,// assessment id currently expanded for score entry
-    editingNotesFor:null    // student name whose notes textarea is open for editing
+    editingNotesFor:null,   // student name whose notes textarea is open for editing
+    studentFilter:'',       // search filter on the Students registry view
+    editingStudentId:null   // student id currently being edited in the registry
   };
 
   function syncRoleFlags(){
@@ -680,6 +683,7 @@
     else if(ui.view==='tournament') html += renderTournament();
     else if(ui.view==='profiles') html += renderProfiles();
     else if(ui.view==='squad') html += renderSquad();
+    else if(ui.view==='students') html += renderStudents();
     html += '</main>';
     if(ui.confirmModal) html += renderModal(ui.confirmModal);
     if(ui.pinModal) html += renderPinModal();
@@ -700,6 +704,7 @@
       <nav class="tabs">
         <button data-nav="home" class="${ui.view==='home'||ui.view==='new'||ui.view==='tournament'?'active':''}">Tournaments</button>
         <button data-nav="profiles" class="${ui.view==='profiles'?'active':''}">Student Profiles</button>
+        <button data-nav="students" class="${ui.view==='students'?'active':''}">Students</button>
         <button data-nav="squad" class="${ui.view==='squad'?'active':''}">Squad</button>
         ${renderCoachLockButton()}
       </nav>
@@ -878,11 +883,15 @@
     </div>`;
 
     if(f.matchFormat==='individual'){
+      const available = DB.students.filter(s=>!f.names.includes(s.name));
       html += `<div class="card">
         <h2>Contestants</h2>
-        <p class="sub">Add each student's name. Mark the ones you already know are relatively strong — the fixture will keep strong players apart in the prelims.</p>
+        <p class="sub">Pick from the student registry — this keeps names consistent (no "Ato" one time and "Ato Sam" the next). Mark the ones you already know are relatively strong — the fixture will keep strong players apart in the prelims.</p>
         <div class="row">
-          <div><input type="text" id="f-nameinput" placeholder="Student name" value="${escapeAttr(f.nameInput)}"></div>
+          <div><select id="f-nameinput">
+            <option value="">${available.length?'Select a student…':'No available students — add one on the Students tab'}</option>
+            ${available.map(s=>`<option value="${escapeAttr(s.name)}">${escapeHtml(s.name)}${s.class?' — '+escapeHtml(s.class):''}</option>`).join('')}
+          </select></div>
           <div style="flex:0;"><button class="btn" data-add-name="1">Add</button></div>
         </div>
         <div style="margin-top:12px;">`;
@@ -898,12 +907,19 @@
         +`</div>`:''}
       </div>`;
     } else {
+      const availableTeam = DB.students.filter(s=>!f.teams.some(tm=>tm.includes(s.name)) && s.name!==f.teamA && s.name!==f.teamB);
       html += `<div class="card">
         <h2>Build teams</h2>
-        <p class="sub">Pair two students into a team. Each match will still be 3-way — three teams competing.</p>
+        <p class="sub">Pair two students into a team, picked from the registry. Each match will still be 3-way — three teams competing.</p>
         <div class="row">
-          <div><input type="text" id="f-teamA" placeholder="Student A" value="${escapeAttr(f.teamA)}"></div>
-          <div><input type="text" id="f-teamB" placeholder="Student B" value="${escapeAttr(f.teamB)}"></div>
+          <div><select id="f-teamA">
+            <option value="">Student A…</option>
+            ${availableTeam.map(s=>`<option value="${escapeAttr(s.name)}" ${f.teamA===s.name?'selected':''}>${escapeHtml(s.name)}</option>`).join('')}
+          </select></div>
+          <div><select id="f-teamB">
+            <option value="">Student B…</option>
+            ${availableTeam.map(s=>`<option value="${escapeAttr(s.name)}" ${f.teamB===s.name?'selected':''}>${escapeHtml(s.name)}</option>`).join('')}
+          </select></div>
           <div style="flex:0;"><button class="btn" data-add-team="1">Add team</button></div>
         </div>
         <div style="margin-top:12px;">`;
@@ -1089,7 +1105,10 @@
     });
     html += `</div>
       <div class="row" style="margin-top:10px;">
-        <div><input type="text" id="f-edit-add-name" placeholder="Add another contestant…"></div>
+        <div><select id="f-edit-add-name">
+          <option value="">${(()=>{const avail=DB.students.filter(s=>!t.competitors.some(c=>c.name===s.name));return avail.length?'Select a student…':'No available students left';})()}</option>
+          ${DB.students.filter(s=>!t.competitors.some(c=>c.name===s.name)).map(s=>`<option value="${escapeAttr(s.name)}">${escapeHtml(s.name)}${s.class?' — '+escapeHtml(s.class):''}</option>`).join('')}
+        </select></div>
         <div style="flex:0;"><button class="btn btn-sm" data-edit-add-competitor="1">Add</button></div>
       </div>
       <div class="row" style="margin-top:8px;">
@@ -1787,6 +1806,77 @@
     return parts.reduce((a,b)=>a+b.v*b.w,0)/totalW;
   }
 
+  /* ============================= STUDENTS REGISTRY ============================= */
+  function renderStudents(){
+    let html = `<h2 class="display" style="font-size:22px;">Students</h2>
+      <p class="sub">The single record of who's actually on the squad — tournaments and Squad reports draw contestants from this list, so a name only ever exists once.</p>`;
+
+    if(ui.isCoach){
+      html += `<div class="card">
+        <h2>Add a student</h2>
+        <div class="row">
+          <div><label class="field">Full name</label><input type="text" id="f-student-name" placeholder="e.g. Ato Sam"></div>
+          <div><label class="field">Year of admission</label><input type="text" id="f-student-year" placeholder="e.g. 2024"></div>
+          <div><label class="field">Class</label><input type="text" id="f-student-class" placeholder="e.g. SHS 2 Science"></div>
+          <div style="flex:0;"><button class="btn btn-brass" data-add-student="1">Add</button></div>
+        </div>
+      </div>`;
+    }
+
+    const students = DB.students.slice();
+    if(students.length===0){
+      html += `<div class="empty card"><div class="display">No students yet</div><p>${ui.isCoach?'Add your first student above.':'Ask your coach to add students to the registry.'}</p></div>`;
+      return html;
+    }
+
+    let names = students;
+    if(ui.studentFilter && ui.studentFilter.trim()){
+      const q = ui.studentFilter.trim().toLowerCase();
+      names = names.filter(s=>s.name.toLowerCase().includes(q));
+    }
+
+    html += `<div class="row" style="margin-bottom:14px;">
+      <div><input type="text" id="f-student-filter" placeholder="Search a name…" value="${escapeAttr(ui.studentFilter||'')}"></div>
+    </div>`;
+
+    // group by year of admission, most recent first
+    const groups = {};
+    names.forEach(s=>{
+      const y = (s.yearOfAdmission||'Unspecified').toString();
+      if(!groups[y]) groups[y] = [];
+      groups[y].push(s);
+    });
+    const years = Object.keys(groups).sort((a,b)=>b.localeCompare(a, undefined, {numeric:true}));
+
+    years.forEach(y=>{
+      const list = groups[y].sort((a,b)=>a.name.localeCompare(b.name));
+      html += `<div class="card">
+        <h2>${y==='Unspecified'?'Year not set':'Class of '+escapeHtml(y)} <span class="pill">${list.length} student${list.length!==1?'s':''}</span></h2>`;
+      list.forEach(s=>{
+        const editing = ui.editingStudentId === s.id;
+        if(editing){
+          html += `<div class="row" style="margin-bottom:8px; align-items:center;">
+            <div><input type="text" id="f-edit-student-name-${s.id}" value="${escapeAttr(s.name)}" placeholder="Name"></div>
+            <div><input type="text" id="f-edit-student-year-${s.id}" value="${escapeAttr(s.yearOfAdmission||'')}" placeholder="Year"></div>
+            <div><input type="text" id="f-edit-student-class-${s.id}" value="${escapeAttr(s.class||'')}" placeholder="Class"></div>
+            <div style="flex:0;"><button class="btn btn-sm btn-brass" data-save-student="${s.id}">Save</button></div>
+            <div style="flex:0;"><button class="btn btn-sm btn-ghost" data-cancel-edit-student="1">Cancel</button></div>
+          </div>`;
+        } else {
+          html += `<div class="t-list-item" style="cursor:default;">
+            <div><h3>${escapeHtml(s.name)}</h3><p>${escapeHtml(s.class||'Class not set')}</p></div>
+            ${ui.isCoach ? `<div style="display:flex; gap:6px;">
+              <button class="btn btn-sm btn-ghost" data-edit-student="${s.id}">Edit</button>
+              <button class="btn btn-sm btn-danger" data-delete-student="${s.id}">Delete</button>
+            </div>` : ''}
+          </div>`;
+        }
+      });
+      html += `</div>`;
+    });
+    return html;
+  }
+
   function renderSquad(){
     let html = `<h2 class="display" style="font-size:22px;">Squad</h2>
       <p class="sub">Attendance, assessments, and quiz performance combined into one selection score.</p>`;
@@ -1819,7 +1909,7 @@
 
   function renderAggregateTable(){
     const profiles = buildAllProfiles();
-    const names = DB.roster.slice().sort();
+    const names = studentNames().slice().sort();
     let rows = names.map(name=>{
       const att = computeAttendancePct(name);
       const asm = computeAssessmentPct(name);
@@ -1847,12 +1937,8 @@
       });
       html += `</tbody></table>`;
     }
-    if(ui.isStaff){
-      html += `<div class="divider"></div>
-        <div class="row">
-          <div><input type="text" id="f-roster-add" placeholder="Add a student to the squad roster…"></div>
-          <div style="flex:0;"><button class="btn btn-sm" data-add-roster="1">Add</button></div>
-        </div>`;
+    if(DB.students.length===0){
+      html += `<div class="divider"></div><p class="small-note">No students in the registry yet — add them on the <a class="link-btn" data-nav="students">Students</a> tab first.</p>`;
     }
     html += `</div>`;
     return html;
@@ -1883,7 +1969,7 @@
       </div>`;
       if(expanded){
         html += `<div class="card" style="background:var(--panel-2); margin-top:-4px; margin-bottom:14px;">`;
-        DB.roster.slice().sort().forEach(name=>{
+        studentNames().slice().sort().forEach(name=>{
           const present = !!(mt.attendance && mt.attendance[name]);
           html += `<label class="checkbox-row" style="margin-bottom:8px;">
             <input type="checkbox" data-meeting-attendance="${mt.id}|${escapeAttr(name)}" ${present?'checked':''} ${ui.isStaff?'':'disabled'}>
@@ -1925,7 +2011,7 @@
       </div>`;
       if(expanded){
         html += `<div class="card" style="background:var(--panel-2); margin-top:-4px; margin-bottom:14px;">`;
-        DB.roster.slice().sort().forEach(name=>{
+        studentNames().slice().sort().forEach(name=>{
           const val = as.scores ? as.scores[name] : undefined;
           html += `<div class="row" style="margin-bottom:8px; align-items:center;">
             <div style="flex:2;">${escapeHtml(name)}</div>
@@ -1966,8 +2052,7 @@
 
     const nameInputEl = q('#f-nameinput');
     if(nameInputEl){
-      nameInputEl.addEventListener('input', e=>{ newTForm.nameInput = e.target.value; });
-      nameInputEl.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); addNameToForm(); } });
+      nameInputEl.addEventListener('change', e=>{ newTForm.nameInput = e.target.value; });
     }
     const addNameBtn = q('[data-add-name]');
     if(addNameBtn) addNameBtn.addEventListener('click', addNameToForm);
@@ -1984,8 +2069,8 @@
       render();
     }));
 
-    const teamAEl = q('#f-teamA'); if(teamAEl) teamAEl.addEventListener('input', e=>{ newTForm.teamA = e.target.value; });
-    const teamBEl = q('#f-teamB'); if(teamBEl) teamBEl.addEventListener('input', e=>{ newTForm.teamB = e.target.value; });
+    const teamAEl = q('#f-teamA'); if(teamAEl) teamAEl.addEventListener('change', e=>{ newTForm.teamA = e.target.value; });
+    const teamBEl = q('#f-teamB'); if(teamBEl) teamBEl.addEventListener('change', e=>{ newTForm.teamB = e.target.value; });
     const addTeamBtn = q('[data-add-team]');
     if(addTeamBtn) addTeamBtn.addEventListener('click', ()=>{
       if(newTForm.teamA.trim() && newTForm.teamB.trim()){
@@ -2242,11 +2327,6 @@
     // Squad: weights, roster, meetings, assessments
     const saveWeightsBtn = q('[data-save-weights]');
     if(saveWeightsBtn) saveWeightsBtn.addEventListener('click', saveWeights);
-    const addRosterBtn = q('[data-add-roster]');
-    if(addRosterBtn) addRosterBtn.addEventListener('click', addToRoster);
-    const rosterInput = q('#f-roster-add');
-    if(rosterInput) rosterInput.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); addToRoster(); } });
-
     const addMeetingBtn = q('[data-add-meeting]');
     if(addMeetingBtn) addMeetingBtn.addEventListener('click', addMeeting);
     qa('[data-toggle-meeting]').forEach(el=>el.addEventListener('click', ()=>{
@@ -2294,6 +2374,20 @@
 
     const profFilter = q('#f-profile-filter');
     if(profFilter) profFilter.addEventListener('input', e=>{ ui.profileFilter = e.target.value; render(); });
+    const addStudentBtn = q('[data-add-student]');
+    if(addStudentBtn) addStudentBtn.addEventListener('click', addStudent);
+    const studentFilterEl = q('#f-student-filter');
+    if(studentFilterEl) studentFilterEl.addEventListener('input', e=>{ ui.studentFilter=e.target.value; render(); });
+    qa('[data-edit-student]').forEach(el=>el.addEventListener('click', ()=>{ ui.editingStudentId=el.getAttribute('data-edit-student'); render(); }));
+    const cancelEditStudentBtn = q('[data-cancel-edit-student]');
+    if(cancelEditStudentBtn) cancelEditStudentBtn.addEventListener('click', ()=>{ ui.editingStudentId=null; render(); });
+    qa('[data-save-student]').forEach(el=>el.addEventListener('click', ()=>{ saveStudentEdit(el.getAttribute('data-save-student')); }));
+    qa('[data-delete-student]').forEach(el=>el.addEventListener('click', ()=>{
+      const id = el.getAttribute('data-delete-student');
+      const s = DB.students.find(x=>x.id===id);
+      openConfirm('Delete this student?', `This removes ${s?s.name:'this student'} from the registry. Past tournament results stay intact, but they'll no longer be selectable for new fixtures or appear in Squad. This cannot be undone.`, ()=>deleteStudent(id));
+    }));
+
     qa('[data-toggle-profile]').forEach(el=>el.addEventListener('click', ()=>{
       const name = el.getAttribute('data-toggle-profile');
       ui.expandedProfile = (ui.expandedProfile===name) ? null : name;
@@ -2455,7 +2549,6 @@
     await sSet('tournament:'+t.id, t);
     DB.tIndex.push({id:t.id, name:t.name, createdAt:t.createdAt, matchFormat:t.matchFormat, status:'live', stageLabel:'Prelims', competitorCount:competitors.length});
     await sSet('tournament_index', DB.tIndex);
-    await refreshRosterFromCompetitors(competitors);
     if(!DB.fullCache) DB.fullCache = [];
     DB.fullCache.push(t);
     currentTournament = t;
@@ -2463,17 +2556,6 @@
     ui.view = 'tournament';
     newTForm = null;
     render();
-  }
-
-  async function refreshRosterFromCompetitors(competitors){
-    const names = new Set(DB.roster);
-    competitors.forEach(c=>{
-      if(c.type==='guest') return; // guest schools aren't tracked individually
-      if(c.memberNames) c.memberNames.forEach(n=>names.add(n));
-      else names.add(c.name);
-    });
-    DB.roster = Array.from(names);
-    await sSet('roster', DB.roster);
   }
 
   async function openTournament(id){
@@ -2527,7 +2609,6 @@
     const newC = { id: uid('c'), name, seed:false, type:'individual' };
     t.competitors.push(newC);
     t.stages[0].competitorIds.push(newC.id);
-    await refreshRosterFromCompetitors([newC]);
     await saveCurrentTournament();
     render();
   }
@@ -2597,15 +2678,17 @@
     if(!ui.isCoach){ alert('Coach mode is required.'); return; }
     for(const t of DB.tIndex){ await sDelete('tournament:'+t.id); }
     DB.tIndex = [];
-    DB.roster = [];
+    DB.students = [];
     DB.fullCache = [];
     DB.meetings = [];
     DB.assessments = [];
+    DB.notes = {};
     DB.weights = {attendance:30, assessment:30, quiz:40};
     await sSet('tournament_index', []);
-    await sSet('roster', []);
+    await sSet('students', []);
     await sSet('meetings', []);
     await sSet('assessments', []);
+    await sSet('student_notes', {});
     await sSet('selection_weights', DB.weights);
     currentTournament = null;
     ui.view = 'home';
@@ -2623,17 +2706,39 @@
     render();
   }
 
-  async function addToRoster(){
-    if(!ui.isStaff) return;
-    const el = q('#f-roster-add');
-    const name = (el ? el.value : '').trim();
-    if(!name) return;
-    if(!DB.roster.includes(name)){
-      DB.roster.push(name);
-      await sSet('roster', DB.roster);
-    } else {
-      toast('That name is already on the roster.', 'error');
+  async function addStudent(){
+    if(!ui.isCoach){ toast('Coach access is required to add students.', 'error'); return; }
+    const nameEl = q('#f-student-name'), yearEl = q('#f-student-year'), classEl = q('#f-student-class');
+    const name = (nameEl?nameEl.value:'').trim();
+    if(!name){ toast('Enter a name.', 'error'); return; }
+    if(DB.students.some(s=>s.name.toLowerCase()===name.toLowerCase())){
+      toast('A student with that exact name already exists.', 'error'); return;
     }
+    DB.students.push({ id: uid('stu'), name, yearOfAdmission: (yearEl?yearEl.value:'').trim(), class: (classEl?classEl.value:'').trim(), createdAt: Date.now() });
+    await sSet('students', DB.students);
+    render();
+  }
+
+  async function saveStudentEdit(id){
+    if(!ui.isCoach) return;
+    const s = DB.students.find(x=>x.id===id);
+    if(!s) return;
+    const nameEl = q(`#f-edit-student-name-${id}`), yearEl = q(`#f-edit-student-year-${id}`), classEl = q(`#f-edit-student-class-${id}`);
+    const name = (nameEl?nameEl.value:'').trim();
+    if(!name){ toast('Name cannot be empty.', 'error'); return; }
+    s.name = name;
+    s.yearOfAdmission = (yearEl?yearEl.value:'').trim();
+    s.class = (classEl?classEl.value:'').trim();
+    await sSet('students', DB.students);
+    ui.editingStudentId = null;
+    toast('Student updated.', 'success');
+    render();
+  }
+
+  async function deleteStudent(id){
+    if(!ui.isCoach) return;
+    DB.students = DB.students.filter(s=>s.id!==id);
+    await sSet('students', DB.students);
     render();
   }
 
@@ -2645,7 +2750,7 @@
     if(!name){ toast('Enter a meeting name.', 'error'); return; }
     const date = dateEl ? dateEl.value : '';
     const attendance = {};
-    DB.roster.forEach(n=>{ attendance[n] = false; });
+    studentNames().forEach(n=>{ attendance[n] = false; });
     const mt = { id: uid('mt'), name, date, createdAt: Date.now(), attendance };
     DB.meetings.push(mt);
     await sSet('meetings', DB.meetings);
@@ -2811,7 +2916,8 @@
 
   /* ============================= INIT ============================= */
   async function init(){
-    const roster = await sGet('roster');
+    const students = await sGet('students');
+    const legacyRoster = await sGet('roster'); // migrate from the old free-text roster
     const tIndex = await sGet('tournament_index');
     const accessPins = await sGet('access_pins');
     const legacyCoachPin = await sGet('coach_pin'); // migrate from the old single-PIN system
@@ -2819,7 +2925,14 @@
     const assessments = await sGet('assessments');
     const weights = await sGet('selection_weights');
     const notes = await sGet('student_notes');
-    DB.roster = roster || [];
+    if(students){
+      DB.students = students;
+    } else if(legacyRoster && legacyRoster.length){
+      DB.students = legacyRoster.map(name=>({ id: uid('stu'), name, yearOfAdmission:'', class:'', createdAt: Date.now() }));
+      await sSet('students', DB.students); // one-time migration — year/class left blank, fill in on the Students tab
+    } else {
+      DB.students = [];
+    }
     DB.tIndex = tIndex || [];
     DB.meetings = meetings || [];
     DB.assessments = assessments || [];
