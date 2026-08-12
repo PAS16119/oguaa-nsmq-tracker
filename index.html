@@ -308,7 +308,7 @@
   // this app works when deployed independently (e.g. on Vercel).
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
   import {
-    getDatabase, ref, get as fbGet, set as fbSet, remove as fbRemove
+    getDatabase, ref, get as fbGet, set as fbSet, remove as fbRemove, onValue as fbOnValue
   } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
 
   const firebaseConfig = {
@@ -355,6 +355,13 @@
     },
     async list(){
       return { keys: [], shared: true }; // not used by this app
+    },
+    // Real-time subscription: calls onChange(value) immediately and again
+    // whenever the data changes on any device. Returns an unsubscribe function.
+    subscribe(key, onChange){
+      const r = ref(db, ROOT + "/" + safeKey(key));
+      const unsub = fbOnValue(r, snap=>{ onChange(snap.exists() ? snap.val() : null); });
+      return unsub;
     }
   };
 </script>
@@ -521,20 +528,22 @@
   /* ============================= NSMQ LIVE ROUND SCORING ============================= */
   const SUBJECTS = ['Biology','Physics','Chemistry','Mathematics'];
   const ROUND_INFO = {
-    fundamentals: { label:'Fundamentals', count:8,  mainCorrect:3, mainWrong:0,  bonusCorrect:1, bonusWrong:-1 },
+    fundamentals: { label:'Fundamentals', count:8,  mainCorrect:3, mainPresets:[3,2,1,0], bonusCorrect:1, bonusWrong:-1 },
     speedRace:    { label:'Speed Race',   count:12, ladder:[3,2,1], wrong:-1 },
     potd:         { label:'Problem of the Day', max:10 },
-    trueFalse:    { label:'True/False',   count:8,  mainCorrect:2, mainWrong:-1, bonusCorrect:2, bonusWrong:-1 },
+    trueFalse:    { label:'True/False',   count:8,  mainCorrect:2, mainPresets:[2,-1], bonusCorrect:2, bonusWrong:-1 },
     riddles:      { label:'Riddles', count:4, cluePoints:{1:5,2:4,3:3} }
   };
 
   function makeGridSlots(m, count){
     // Each slot = one subject-question-position, and EVERY contestant has their own
-    // turn at it (not one shared question). If a contestant's own turn is wrong,
-    // the bonus opens to the other contestants and is credited under that same slot.
+    // turn at it (not one shared question). mainScore holds the marks actually
+    // awarded (supports partial credit, e.g. a quizmaster giving 2 or 1 out of 3).
+    // If a contestant's own turn isn't full marks, the bonus opens to the other
+    // contestants and is credited under that same slot.
     return Array.from({length:count}, (_,i)=>{
       const turns = {};
-      m.slots.forEach(cid=>{ turns[cid] = { mainResult:null, bonusCid:null, bonusResult:null }; });
+      m.slots.forEach(cid=>{ turns[cid] = { mainScore:null, bonusCid:null, bonusResult:null }; });
       return { subject: SUBJECTS[Math.floor(i/2)%4], turns };
     });
   }
@@ -557,8 +566,7 @@
     (m.live[roundKey]||[]).forEach(slot=>{
       Object.entries(slot.turns||{}).forEach(([cid, turn])=>{
         if(totals[cid]===undefined) return;
-        if(turn.mainResult==='correct') totals[cid] += info.mainCorrect;
-        else if(turn.mainResult==='wrong' && info.mainWrong) totals[cid] += info.mainWrong;
+        if(turn.mainScore!=null) totals[cid] += turn.mainScore;
         if(turn.bonusCid && turn.bonusResult){
           const pts = turn.bonusResult==='correct' ? info.bonusCorrect : info.bonusWrong;
           if(totals[turn.bonusCid]===undefined) totals[turn.bonusCid]=0;
@@ -1149,11 +1157,15 @@
     const key = stageIdx+'|'+mi;
     const isOpen = ui.openLiveScorerKey === key;
     const rankLabel = {1:'1st',2:'2nd',3:'3rd'};
+    const seatLabel = {0:'Seat 1',1:'Seat 2',2:'Seat 3'};
 
     let html = `<div class="match-ticket">
       <div class="m-head">
         <span class="m-label">Match ${num}${m.completed?' · <span class="completed-tag">Recorded</span>':''}</span>
-        ${canScore ? `<button type="button" class="btn btn-sm ${isOpen?'btn-brass':'btn-ghost'} no-print" data-toggle-live-scorer="${key}">${isOpen?'▾ Hide scorer':'▸ '+(m.completed?'Edit score':'Score live')}</button>` : ''}
+        <div style="display:flex; gap:6px;">
+          ${canEdit && !m.completed ? `<button type="button" class="btn btn-sm btn-ghost no-print" data-ballot-seats="${mi}" title="Randomly reorder who sits in Seat 1/2/3 — doesn't change who's competing">🎲 Ballot seats</button>` : ''}
+          ${canScore ? `<button type="button" class="btn btn-sm ${isOpen?'btn-brass':'btn-ghost'} no-print" data-toggle-live-scorer="${key}">${isOpen?'▾ Hide scorer':'▸ '+(m.completed?'Edit score':'Score live')}</button>` : ''}
+        </div>
       </div>
       <div class="m-players">`;
 
@@ -1164,14 +1176,15 @@
       const rankText = result && result.rank ? (result.tied?'T-':'')+rankLabel[result.rank] : '';
       if(canEdit && !m.completed){
         html += `<div class="m-player-row">
+          <span class="pill" style="min-width:56px;">${seatLabel[slotIdx]}</span>
           <span class="print-only-name">${isGuest?'🏫 ':''}${escapeHtml(competitorName(t,cid))}${isSeed?' ★':''}</span>
           <select data-slot-edit="${mi}|${slotIdx}">
             ${stage.competitorIds.map(oc=>`<option value="${oc}" ${oc===cid?'selected':''}>${isGuestCompetitor(t,oc)?'🏫 ':''}${escapeHtml(competitorName(t,oc))}</option>`).join('')}
           </select>
-          <span class="pill">Pending</span>
         </div>`;
       } else {
         html += `<div class="m-player-row">
+          <span class="pill" style="min-width:56px;">${seatLabel[slotIdx]}</span>
           <span class="name">${isGuest?'🏫 ':''}${escapeHtml(competitorName(t,cid))}${isSeed?'<span class="seed-star">★</span>':''}</span>
           ${m.completed ? `<span class="pill gold">${rankText}${result&&result.score!==undefined?' · '+result.score+' pts':''}</span>` : `<span class="pill">Pending</span>`}
         </div>`;
@@ -1212,10 +1225,7 @@
   function cellValueForGrid(slot, cid, info){
     let val = 0;
     const own = slot.turns[cid];
-    if(own){
-      if(own.mainResult==='correct') val += info.mainCorrect;
-      else if(own.mainResult==='wrong') val += info.mainWrong;
-    }
+    if(own && own.mainScore!=null) val += own.mainScore;
     Object.entries(slot.turns).forEach(([ownerCid, turn])=>{
       if(ownerCid!==cid && turn.bonusCid===cid && turn.bonusResult){
         val += turn.bonusResult==='correct' ? info.bonusCorrect : info.bonusWrong;
@@ -1227,9 +1237,10 @@
   function renderMainBonusRound(m, mi, roundKey, names, slots){
     const info = ROUND_INFO[roundKey];
     const items = m.live[roundKey];
+    const presetLabel = (v)=> v===info.mainCorrect ? `✓ ${v}` : (v<0 ? `✗ ${v}` : `${v}`);
     let html = `<div class="round-block">
-      <div class="round-head">${info.label} <span class="pill">correct +${info.mainCorrect} · wrong ${info.mainWrong} · bonus +${info.bonusCorrect}/${info.bonusWrong}</span></div>
-      <div class="small-note" style="margin-bottom:8px;">Each contestant has their own question at every slot — tap the subject if the order isn't fixed, mark ✓/✗, and a bonus opens automatically to the other two if wrong.</div>
+      <div class="round-head">${info.label} <span class="pill">marks: ${info.mainPresets.join(' / ')} · bonus +${info.bonusCorrect}/${info.bonusWrong}</span></div>
+      <div class="small-note" style="margin-bottom:8px;">Each contestant has their own question at every slot — tap the subject if the order isn't fixed, tap the marks actually awarded (partial credit allowed), and a bonus opens automatically to the other two if not full marks.</div>
       <div class="grid-scroll">
       <table class="score-grid">
         <thead><tr>
@@ -1247,16 +1258,16 @@
       let rowTotal = 0;
       let cells = '';
       items.forEach((slot, idx)=>{
-        const own = slot.turns[cid] || {mainResult:null,bonusCid:null,bonusResult:null};
+        const own = slot.turns[cid] || {mainScore:null,bonusCid:null,bonusResult:null};
         const cellVal = cellValueForGrid(slot, cid, info);
         rowTotal += cellVal;
+        const needsBonus = own.mainScore!=null && own.mainScore < info.mainCorrect;
         cells += `<td class="grid-cell">
           <div class="grid-cell-value ${cellVal>0?'pos':cellVal<0?'neg':''}">${cellVal}</div>
           <div class="grid-toggle">
-            <button type="button" class="gbtn ${own.mainResult==='correct'?'on-correct':''}" data-live-main-result="${mi}|${roundKey}|${idx}|${cid}|correct">✓</button>
-            <button type="button" class="gbtn ${own.mainResult==='wrong'?'on-wrong':''}" data-live-main-result="${mi}|${roundKey}|${idx}|${cid}|wrong">✗</button>
+            ${info.mainPresets.map(v=>`<button type="button" class="gbtn ${own.mainScore===v?(v===info.mainCorrect?'on-correct':'on-wrong'):''}" data-live-main-score="${mi}|${roundKey}|${idx}|${cid}|${v}">${presetLabel(v)}</button>`).join('')}
           </div>
-          ${own.mainResult==='wrong' ? `
+          ${needsBonus ? `
             <select class="mini-select" data-live-bonus-cid="${mi}|${roundKey}|${idx}|${cid}">
               <option value="">Bonus…</option>
               ${slots.filter(oc=>oc!==cid).map(oc=>`<option value="${oc}" ${own.bonusCid===oc?'selected':''}>${escapeHtml(names[oc]).slice(0,8)}</option>`).join('')}
@@ -1727,9 +1738,8 @@
             const info = ROUND_INFO[roundKey];
             (m.live[roundKey]||[]).forEach(slot=>{
               Object.entries(slot.turns||{}).forEach(([cid, turn])=>{
-                if(turn.mainResult){
-                  const pts = turn.mainResult==='correct' ? info.mainCorrect : info.mainWrong;
-                  credit(cid, slot.subject, pts, turn.mainResult==='correct', roundKey);
+                if(turn.mainScore!=null){
+                  credit(cid, slot.subject, turn.mainScore, turn.mainScore>=info.mainCorrect, roundKey);
                 }
                 if(turn.bonusCid && turn.bonusResult){
                   const pts = turn.bonusResult==='correct' ? info.bonusCorrect : info.bonusWrong;
@@ -2032,6 +2042,7 @@
   function bindEvents(){
     qa('[data-nav]').forEach(el=>el.addEventListener('click', async ()=>{
       const v = el.getAttribute('data-nav');
+      if(v!=='tournament') stopWatchingTournament();
       if(v==='new') newTForm = freshNewTForm();
       ui.view = v;
       render();
@@ -2189,6 +2200,10 @@
       render();
     }));
 
+    qa('[data-ballot-seats]').forEach(el=>el.addEventListener('click', ()=>{
+      ballotSeats(parseInt(el.getAttribute('data-ballot-seats')));
+    }));
+
     qa('[data-toggle-live-scorer]').forEach(el=>el.addEventListener('click', ()=>{
       const key = el.getAttribute('data-toggle-live-scorer');
       ui.openLiveScorerKey = (ui.openLiveScorerKey===key) ? null : key;
@@ -2202,12 +2217,13 @@
       m.live[roundKey][parseInt(idx)].subject = e.target.value;
       saveCurrentTournament(); render();
     }));
-    qa('[data-live-main-result]').forEach(el=>el.addEventListener('click', ()=>{
-      const [mi, roundKey, idx, cid, result] = el.getAttribute('data-live-main-result').split('|');
+    qa('[data-live-main-score]').forEach(el=>el.addEventListener('click', ()=>{
+      const [mi, roundKey, idx, cid, valueStr] = el.getAttribute('data-live-main-score').split('|');
+      const value = parseFloat(valueStr);
       const m = currentTournament.stages[currentTournament.currentStageIndex].matches[parseInt(mi)];
       const turn = m.live[roundKey][parseInt(idx)].turns[cid];
-      turn.mainResult = result;
-      if(result==='correct'){ turn.bonusCid=null; turn.bonusResult=null; }
+      turn.mainScore = value;
+      if(value >= ROUND_INFO[roundKey].mainCorrect){ turn.bonusCid=null; turn.bonusResult=null; }
       saveCurrentTournament(); render();
     }));
     qa('[data-live-bonus-cid]').forEach(el=>el.addEventListener('change', e=>{
@@ -2558,7 +2574,13 @@
     render();
   }
 
+  let tournamentUnsub = null;
+  function stopWatchingTournament(){
+    if(tournamentUnsub){ tournamentUnsub(); tournamentUnsub = null; }
+  }
+
   async function openTournament(id){
+    stopWatchingTournament();
     const t = await sGet('tournament:'+id);
     if(!t){ alert('Could not load this tournament.'); return; }
     currentTournament = t;
@@ -2568,6 +2590,14 @@
     ui.qualifySelectionStage = null;
     ui.viewingStageIdx = t.currentStageIndex;
     render();
+    // live sync: any device's changes to this tournament now appear here automatically
+    tournamentUnsub = window.storage.subscribe('tournament:'+id, (val)=>{
+      if(!val || ui.tId!==id || ui.view!=='tournament') return;
+      currentTournament = val;
+      const idx = (DB.fullCache||[]).findIndex(x=>x.id===id);
+      if(idx>=0) DB.fullCache[idx] = val;
+      render();
+    });
   }
 
   async function toggleCompetitorSeed(cid){
@@ -2627,6 +2657,17 @@
     render();
   }
 
+  async function ballotSeats(mi){
+    if(!ui.isStaff){ toast('Staff or coach access is required.', 'error'); return; }
+    const stage = currentTournament.stages[currentTournament.currentStageIndex];
+    const m = stage.matches[mi];
+    if(m.completed){ toast('This match is already recorded — reset it first to re-ballot.', 'error'); return; }
+    shuffleArr(m.slots); // same 3 competitors, new seat order — the fixture itself is untouched
+    await saveCurrentTournament();
+    toast('Seats balloted.', 'success');
+    render();
+  }
+
   async function resetFixtureForStage(stageIdx){
     const stage = currentTournament.stages[stageIdx];
     const anyCompleted = stage.matches.some(m=>m.completed);
@@ -2665,6 +2706,7 @@
 
   async function deleteTournament(id){
     if(!ui.isCoach){ alert('Coach mode is required.'); return; }
+    stopWatchingTournament();
     await sDelete('tournament:'+id);
     DB.tIndex = DB.tIndex.filter(x=>x.id!==id);
     await sSet('tournament_index', DB.tIndex);
