@@ -410,6 +410,7 @@
     expandedAssessment:null,// assessment id currently expanded for score entry
     editingNotesFor:null,   // student name whose notes textarea is open for editing
     studentFilter:'',       // search filter on the Students registry view
+    lastFixtureError:null,  // persistent (not just toast) message when fixture generation last failed
     editingStudentId:null   // student id currently being edited in the registry
   };
 
@@ -429,6 +430,12 @@
     const n = competitorIds.length;
     if((n*gamesEach) % 3 !== 0){
       return {ok:false, reason:`${n} competitors × ${gamesEach} games = ${n*gamesEach} player-slots, which isn't divisible by 3. Adjust games-per-competitor or the roster size.`};
+    }
+    // basic feasibility: with no repeats, each competitor needs gamesEach*2 distinct
+    // opponents, which can't exceed the (n-1) other people available.
+    const maxGamesForNoRepeat = Math.floor((n-1)/2);
+    if(gamesEach > maxGamesForNoRepeat){
+      return {ok:false, reason:`With ${n} competitors, "no repeat opponents" only works up to ${maxGamesForNoRepeat} game${maxGamesForNoRepeat!==1?'s':''} each (since everyone would need ${gamesEach*2} different opponents, but only ${n-1} other people exist). Lower games-per-competitor to ${maxGamesForNoRepeat}, add more competitors, or use "Balanced seed groups" instead.`};
     }
     // feasibility check for seed separation: s <= 3n/(2g+3)
     if(seedSet.size>0){
@@ -1050,6 +1057,7 @@
               <div style="flex:0;"><button class="btn btn-brass" data-gen-final="${stageIdx}">Generate</button></div>
             </div>`;
         } else if(stage.competitorIds.length>=3) {
+          if(ui.lastFixtureError) html += `<div class="warn-box">${escapeHtml(ui.lastFixtureError)}</div>`;
           html += `<div class="row">
               <div style="flex:0;"><button class="btn btn-brass" data-gen-norepeat="${stageIdx}">Auto-generate (no repeat opponents)</button></div>
               <div style="flex:0;"><button class="btn" data-gen-serpentine="${stageIdx}">Auto-generate (balanced seed groups)</button></div>
@@ -2591,6 +2599,7 @@
     ui.qualifySelection = null;
     ui.qualifySelectionStage = null;
     ui.viewingStageIdx = t.currentStageIndex;
+    ui.lastFixtureError = null;
     render();
     // live sync: any device's changes to this tournament now appear here automatically
     tournamentUnsub = window.storage.subscribe('tournament:'+id, (val)=>{
@@ -2878,7 +2887,7 @@
 
     if(mode==='norepeat'){
       const result = generateNoRepeatFixture(stage.competitorIds, stage.gamesPerCompetitor, seedIds);
-      if(!result.ok){ alert(result.reason); return; }
+      if(!result.ok){ ui.lastFixtureError = result.reason; toast(result.reason, 'error'); render(); return; }
       const rounds = packIntoRounds(result.matches);
       stage.matches = [];
       rounds.forEach(round=>{
@@ -2895,9 +2904,13 @@
       const groups = generateSerpentineFixture(rankedIds, 3);
       // validate group sizes are all 3
       const bad = groups.find(g=>g.slots.length!==3);
-      if(bad){ alert('Balanced grouping needs the competitor count to be a multiple of 3. Adjust qualifier count and try again.'); return; }
+      if(bad){
+        const msg = 'Balanced grouping needs the competitor count to be a multiple of 3. Adjust qualifier count and try again.';
+        ui.lastFixtureError = msg; toast(msg, 'error'); render(); return;
+      }
       stage.matches = groups.map(g=>({id:uid('m'), slots:g.slots, results:{}, completed:false}));
     }
+    ui.lastFixtureError = null;
     saveCurrentTournament();
     render();
   }
