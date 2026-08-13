@@ -360,7 +360,15 @@
     // whenever the data changes on any device. Returns an unsubscribe function.
     subscribe(key, onChange){
       const r = ref(db, ROOT + "/" + safeKey(key));
-      const unsub = fbOnValue(r, snap=>{ onChange(snap.exists() ? snap.val() : null); });
+      const unsub = fbOnValue(r, snap=>{
+        if(!snap.exists()){ onChange(null); return; }
+        const raw = snap.val();
+        // Values are always written as JSON strings (see set() / sSet), so
+        // parse here too — otherwise callbacks get a raw string instead of
+        // the object they expect (this was breaking renderTournament).
+        try{ onChange(JSON.parse(raw)); }
+        catch(e){ onChange(raw); }
+      });
       return unsub;
     }
   };
