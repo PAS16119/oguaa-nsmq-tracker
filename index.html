@@ -1687,7 +1687,7 @@
     const el = appEl.querySelector(`[id="f-notes-${name.replace(/"/g,'\\"')}"]`);
     const val = el ? el.value.trim() : '';
     if(val) DB.notes[name] = val; else delete DB.notes[name];
-    await sSet('student_notes', DB.notes);
+    sSet('student_notes', DB.notes);
     ui.editingNotesFor = null;
     toast('Note saved.', 'success');
     render();
@@ -2141,7 +2141,7 @@
         t.stages.pop();
         t.currentStageIndex = t.stages.length-1;
         ui.viewingStageIdx = t.currentStageIndex;
-        await saveCurrentTournament();
+        saveCurrentTournament();
         render();
       });
     });
@@ -2149,7 +2149,7 @@
     if(undoChampionBtn) undoChampionBtn.addEventListener('click', ()=>{
       openConfirm('Undo champion?', 'This un-declares the champion so you can pick again. The final match results stay intact.', async ()=>{
         currentTournament.champion = null;
-        await saveCurrentTournament();
+        saveCurrentTournament();
         render();
       });
     });
@@ -2575,8 +2575,10 @@
   }
 
   let tournamentUnsub = null;
+  let pendingLocalSaves = 0; // count of our own writes still "in flight" — absorb their echo, don't re-render for them
   function stopWatchingTournament(){
     if(tournamentUnsub){ tournamentUnsub(); tournamentUnsub = null; }
+    pendingLocalSaves = 0;
   }
 
   async function openTournament(id){
@@ -2593,6 +2595,15 @@
     // live sync: any device's changes to this tournament now appear here automatically
     tournamentUnsub = window.storage.subscribe('tournament:'+id, (val)=>{
       if(!val || ui.tId!==id || ui.view!=='tournament') return;
+      if(pendingLocalSaves>0){
+        // this is (most likely) our own write echoing back — data's already current
+        // locally, so just absorb it silently instead of re-rendering on top of
+        // whatever the person is doing right now (this was causing every click to
+        // lag and occasionally swallow taps, like "Score live" not opening)
+        pendingLocalSaves--;
+        currentTournament = val;
+        return;
+      }
       currentTournament = val;
       const idx = (DB.fullCache||[]).findIndex(x=>x.id===id);
       if(idx>=0) DB.fullCache[idx] = val;
@@ -2603,7 +2614,7 @@
   async function toggleCompetitorSeed(cid){
     if(!ui.isStaff) return;
     const c = currentTournament.competitors.find(x=>x.id===cid);
-    if(c){ c.seed = !c.seed; await saveCurrentTournament(); render(); }
+    if(c){ c.seed = !c.seed; saveCurrentTournament(); render(); }
   }
 
   async function saveRename(cid){
@@ -2615,7 +2626,7 @@
     if(c){
       c.name = name;
       ui.editingNameCid = null;
-      await saveCurrentTournament();
+      saveCurrentTournament();
       render();
     }
   }
@@ -2626,7 +2637,7 @@
     if(t.competitors.length<=3){ alert('A tournament needs at least 3 competitors.'); return; }
     t.competitors = t.competitors.filter(c=>c.id!==cid);
     t.stages[0].competitorIds = t.stages[0].competitorIds.filter(id=>id!==cid);
-    await saveCurrentTournament();
+    saveCurrentTournament();
     render();
   }
 
@@ -2639,7 +2650,7 @@
     const newC = { id: uid('c'), name, seed:false, type:'individual' };
     t.competitors.push(newC);
     t.stages[0].competitorIds.push(newC.id);
-    await saveCurrentTournament();
+    saveCurrentTournament();
     render();
   }
 
@@ -2653,7 +2664,7 @@
     t.competitors.push(newC);
     t.stages[0].competitorIds.push(newC.id);
     // guests are not added to the roster — not tracked individually
-    await saveCurrentTournament();
+    saveCurrentTournament();
     render();
   }
 
@@ -2663,7 +2674,7 @@
     const m = stage.matches[mi];
     if(m.completed){ toast('This match is already recorded — reset it first to re-ballot.', 'error'); return; }
     shuffleArr(m.slots); // same 3 competitors, new seat order — the fixture itself is untouched
-    await saveCurrentTournament();
+    saveCurrentTournament();
     toast('Seats balloted.', 'success');
     render();
   }
@@ -2682,14 +2693,20 @@
         stage.matches = [];
         stage.qualifyN = null;
         stage.qualifiedIds = null;
-        await saveCurrentTournament();
+        saveCurrentTournament();
         render();
       }
     );
   }
 
   async function saveCurrentTournament(){
-    await sSet('tournament:'+currentTournament.id, currentTournament);
+    pendingLocalSaves++; // runs synchronously before any await, so it's counted before the echo can arrive
+    const result = await sSet('tournament:'+currentTournament.id, currentTournament);
+    if(!result){
+      pendingLocalSaves = Math.max(0, pendingLocalSaves-1);
+      toast('⚠️ Save failed — check your connection and try again.', 'error');
+      return;
+    }
     // update cache + index
     if(!DB.fullCache) DB.fullCache = [];
     const idx = DB.fullCache.findIndex(x=>x.id===currentTournament.id);
@@ -2743,7 +2760,7 @@
     const s = parseFloat((q('#f-weight-assessment')||{}).value)||0;
     const qz = parseFloat((q('#f-weight-quiz')||{}).value)||0;
     DB.weights = {attendance:a, assessment:s, quiz:qz};
-    await sSet('selection_weights', DB.weights);
+    sSet('selection_weights', DB.weights);
     toast('Weights saved.', 'success');
     render();
   }
@@ -2757,7 +2774,7 @@
       toast('A student with that exact name already exists.', 'error'); return;
     }
     DB.students.push({ id: uid('stu'), name, yearOfAdmission: (yearEl?yearEl.value:'').trim(), class: (classEl?classEl.value:'').trim(), createdAt: Date.now() });
-    await sSet('students', DB.students);
+    sSet('students', DB.students);
     render();
   }
 
@@ -2771,7 +2788,7 @@
     s.name = name;
     s.yearOfAdmission = (yearEl?yearEl.value:'').trim();
     s.class = (classEl?classEl.value:'').trim();
-    await sSet('students', DB.students);
+    sSet('students', DB.students);
     ui.editingStudentId = null;
     toast('Student updated.', 'success');
     render();
@@ -2780,7 +2797,7 @@
   async function deleteStudent(id){
     if(!ui.isCoach) return;
     DB.students = DB.students.filter(s=>s.id!==id);
-    await sSet('students', DB.students);
+    sSet('students', DB.students);
     render();
   }
 
@@ -2795,7 +2812,7 @@
     studentNames().forEach(n=>{ attendance[n] = false; });
     const mt = { id: uid('mt'), name, date, createdAt: Date.now(), attendance };
     DB.meetings.push(mt);
-    await sSet('meetings', DB.meetings);
+    sSet('meetings', DB.meetings);
     ui.expandedMeeting = mt.id;
     render();
   }
@@ -2806,13 +2823,13 @@
     if(!mt) return;
     if(!mt.attendance) mt.attendance = {};
     mt.attendance[name] = checked;
-    await sSet('meetings', DB.meetings);
+    sSet('meetings', DB.meetings);
   }
 
   async function deleteMeeting(id){
     if(!ui.isCoach) return;
     DB.meetings = DB.meetings.filter(m=>m.id!==id);
-    await sSet('meetings', DB.meetings);
+    sSet('meetings', DB.meetings);
     ui.expandedMeeting = null;
     render();
   }
@@ -2828,7 +2845,7 @@
     const date = dateEl ? dateEl.value : '';
     const as = { id: uid('as'), name, maxScore:max, date, createdAt: Date.now(), scores:{} };
     DB.assessments.push(as);
-    await sSet('assessments', DB.assessments);
+    sSet('assessments', DB.assessments);
     ui.expandedAssessment = as.id;
     render();
   }
@@ -2840,13 +2857,13 @@
     if(!as.scores) as.scores = {};
     if(value===''||value==null) delete as.scores[name];
     else as.scores[name] = parseFloat(value);
-    await sSet('assessments', DB.assessments);
+    sSet('assessments', DB.assessments);
   }
 
   async function deleteAssessment(id){
     if(!ui.isCoach) return;
     DB.assessments = DB.assessments.filter(a=>a.id!==id);
-    await sSet('assessments', DB.assessments);
+    sSet('assessments', DB.assessments);
     ui.expandedAssessment = null;
     render();
   }
@@ -2881,7 +2898,7 @@
       if(bad){ alert('Balanced grouping needs the competitor count to be a multiple of 3. Adjust qualifier count and try again.'); return; }
       stage.matches = groups.map(g=>({id:uid('m'), slots:g.slots, results:{}, completed:false}));
     }
-    await saveCurrentTournament();
+    saveCurrentTournament();
     render();
   }
 
@@ -2894,7 +2911,7 @@
     for(let i=0;i<gamesCount;i++){
       stage.matches.push({id:uid('m'), slots:stage.competitorIds.slice(), results:{}, completed:false});
     }
-    await saveCurrentTournament();
+    saveCurrentTournament();
     render();
   }
 
@@ -2909,7 +2926,7 @@
     const anyTie = Object.values(ranked).some(r=>r.tied);
     m.results = ranked;
     m.completed = true;
-    await saveCurrentTournament();
+    saveCurrentTournament();
     toast(anyTie ? 'Tied score detected — points for that position were split evenly.' : 'Match result saved.', anyTie?'info':'success');
     render();
   }
@@ -2939,7 +2956,7 @@
     t.stages.push(nextStage);
     t.currentStageIndex = t.stages.length-1;
     ui.viewingStageIdx = t.currentStageIndex;
-    await saveCurrentTournament();
+    saveCurrentTournament();
     render();
   }
 
@@ -2948,7 +2965,7 @@
     const pickEl = q('#f-champion-pick');
     if(!pickEl) return;
     currentTournament.champion = pickEl.value;
-    await saveCurrentTournament();
+    saveCurrentTournament();
     render();
   }
 
