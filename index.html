@@ -394,7 +394,7 @@
   }
 
   /* ============================= APP STATE ============================= */
-  let DB = { students: [], tIndex: [], pins: {coach:null, staff:null, scorer:null}, meetings: [], assessments: [], weights: {attendance:30, assessment:30, quiz:40}, notes: {} };
+  let DB = { students: [], tIndex: [], pins: {coach:null, staff:null, scorer:null}, meetings: [], assessments: [], weights: {attendance:30, assessment:30, quiz:40}, notes: {}, exams: [] };
   function studentNames(){ return DB.students.map(s=>s.name); }
   let currentTournament = null;          // full loaded tournament object
   let ui = {
@@ -419,7 +419,15 @@
     editingNotesFor:null,   // student name whose notes textarea is open for editing
     studentFilter:'',       // search filter on the Students registry view
     lastFixtureError:null,  // persistent (not just toast) message when fixture generation last failed
-    editingStudentId:null   // student id currently being edited in the registry
+    editingStudentId:null,  // student id currently being edited in the registry
+
+    // ---- Live exams ----
+    expandedExamId:null,    // exam id currently expanded in the staff management list
+    examBuilderOpen:false,  // whether the "new exam" form is showing
+    examMonitor:null,       // {examId, rows:[{name,status,score,maxScore}], avg, submittedCount} — staff live-results snapshot
+    examReview:null,        // {examId, items:[...]} — pending short-answer/numeric responses awaiting staff decision
+    examTakeError:null,     // error message on the student "enter code" screen
+    examAttempt:null        // {exam, name, record, remainingMs} — the student's in-progress attempt, held client-side
   };
 
   function syncRoleFlags(){
@@ -429,6 +437,16 @@
   }
 
   function uid(prefix){ return prefix+'_'+Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
+  function genExamCode(){
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let c=''; for(let i=0;i<5;i++) c+=chars[Math.floor(Math.random()*chars.length)];
+    return c;
+  }
+  function formatMs(ms){
+    const totalSec = Math.max(0, Math.ceil(ms/1000));
+    const m = Math.floor(totalSec/60), s = totalSec%60;
+    return `${m}:${s.toString().padStart(2,'0')}`;
+  }
 
   /* ============================= FIXTURE ENGINE ============================= */
   // Greedy randomized: n competitors, g games each, no repeated pair, optional seed separation.
@@ -698,7 +716,14 @@
   }
   window.alert = (msg)=>toast(msg, 'error'); // catch any stray alert() calls too
 
+  const SCROLLABLE_SEL = '.grid-scroll, [style*="overflow-x"]';
   function render(){
+    // A full re-render replaces the DOM, which would otherwise silently reset
+    // window scroll and any horizontally-scrollable panel (e.g. the wide live-
+    // scoring grids) back to the top-left on every click or keystroke. Snapshot
+    // and restore both so typing/tapping doesn't visually yank the page around.
+    const scrollX = window.scrollX, scrollY = window.scrollY;
+    const prevScrolls = Array.from(appEl.querySelectorAll(SCROLLABLE_SEL)).map(el=>el.scrollLeft);
     let html = renderHeader();
     html += '<main>';
     if(ui.view==='home') html += renderHome();
@@ -707,11 +732,15 @@
     else if(ui.view==='profiles') html += renderProfiles();
     else if(ui.view==='squad') html += renderSquad();
     else if(ui.view==='students') html += renderStudents();
+    else if(ui.view==='exams') html += renderExams();
     html += '</main>';
     if(ui.confirmModal) html += renderModal(ui.confirmModal);
     if(ui.pinModal) html += renderPinModal();
     appEl.innerHTML = html;
     bindEvents();
+    window.scrollTo(scrollX, scrollY);
+    const newScrolls = appEl.querySelectorAll(SCROLLABLE_SEL);
+    newScrolls.forEach((el,i)=>{ if(prevScrolls[i]!=null) el.scrollLeft = prevScrolls[i]; });
   }
 
   function renderHeader(){
@@ -729,6 +758,7 @@
         <button data-nav="profiles" class="${ui.view==='profiles'?'active':''}">Student Profiles</button>
         <button data-nav="students" class="${ui.view==='students'?'active':''}">Students</button>
         <button data-nav="squad" class="${ui.view==='squad'?'active':''}">Squad</button>
+        <button data-nav="exams" class="${ui.view==='exams'?'active':''}">Exams</button>
         ${renderCoachLockButton()}
       </nav>
     </header>`;
@@ -1080,6 +1110,7 @@
         html += `<div class="divider"></div>
           <button class="btn btn-sm btn-ghost" data-reset-fixture="${stageIdx}">↺ ${anyCompleted?'Reset fixture (clears recorded results)':'Regenerate fixture'}</button>`;
       }
+      if(canEdit) html += renderSubstitutePanel(t, stage, stageIdx);
       html += renderFixtureWarnings(t, stage);
       html += `<div class="divider"></div>
         <div class="flex-between" style="margin-bottom:10px;">
@@ -1144,6 +1175,27 @@
       <p class="small-note">Tap the star to mark/unmark a strong contestant. Guest schools (🏫) compete normally in the fixture but aren't tracked in Student Profiles or Squad reports.</p>
     </div>`;
     return html;
+  }
+
+  function renderSubstitutePanel(t, stage, stageIdx){
+    const availStudents = DB.students.filter(s=>!t.competitors.some(c=>c.name===s.name));
+    return `<div class="card" style="background:var(--panel-2); margin-bottom:14px;">
+      <div class="flex-between">
+        <h3 style="margin:0;font-size:14px;">Substitute / late addition</h3>
+      </div>
+      <p class="small-note" style="margin:6px 0 10px;">Add someone who wasn't in the original setup — e.g. covering for an absent contestant. Once added here, they'll appear in the seat dropdown on any match below, so you can swap them in for whoever's absent.</p>
+      <div class="row">
+        <div><select id="f-sub-add-name-${stageIdx}">
+          <option value="">${availStudents.length?'Select a student…':'No available students left — add them on the Students tab first'}</option>
+          ${availStudents.map(s=>`<option value="${escapeAttr(s.name)}">${escapeHtml(s.name)}${s.class?' — '+escapeHtml(s.class):''}</option>`).join('')}
+        </select></div>
+        <div style="flex:0;"><button class="btn btn-sm" data-add-substitute="${stageIdx}">Add to this stage</button></div>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <div><input type="text" id="f-sub-add-guest-${stageIdx}" placeholder="Or add a guest school…"></div>
+        <div style="flex:0;"><button class="btn btn-sm" data-add-substitute-guest="${stageIdx}">Add guest</button></div>
+      </div>
+    </div>`;
   }
 
   function renderFixtureWarnings(t, stage){
@@ -1256,7 +1308,7 @@
     const presetLabel = (v)=> v===info.mainCorrect ? `✓ ${v}` : (v<0 ? `✗ ${v}` : `${v}`);
     let html = `<div class="round-block">
       <div class="round-head">${info.label} <span class="pill">marks: ${info.mainPresets.join(' / ')} · bonus +${info.bonusCorrect}/${info.bonusWrong}</span></div>
-      <div class="small-note" style="margin-bottom:8px;">Each contestant has their own question at every slot — tap the subject if the order isn't fixed, tap the marks actually awarded (partial credit allowed), and a bonus opens automatically to the other two if not full marks.</div>
+      <div class="small-note" style="margin-bottom:8px;">Each contestant has their own question at every slot — tap the subject if the order isn't fixed, tap the marks actually awarded (partial credit allowed). If a contestant doesn't get full marks — including leaving it blank because they didn't answer — the bonus opens automatically for the other two, worth the full bonus amount; the contestant who skipped keeps their 0.</div>
       <div class="grid-scroll">
       <table class="score-grid">
         <thead><tr>
@@ -1277,7 +1329,7 @@
         const own = slot.turns[cid] || {mainScore:null,bonusCid:null,bonusResult:null};
         const cellVal = cellValueForGrid(slot, cid, info);
         rowTotal += cellVal;
-        const needsBonus = own.mainScore!=null && own.mainScore < info.mainCorrect;
+        const needsBonus = own.mainScore==null || own.mainScore < info.mainCorrect;
         cells += `<td class="grid-cell">
           <div class="grid-cell-value ${cellVal>0?'pos':cellVal<0?'neg':''}">${cellVal}</div>
           <div class="grid-toggle">
@@ -1569,6 +1621,17 @@
         }
       }
 
+      const asmSubj = computeAssessmentSubjectPct(name);
+      const asmSubjEntries = SUBJECTS.map(s=>asmSubj[s]).filter(v=>v.pct!=null);
+      if(asmSubjEntries.length>0){
+        html += `<div class="divider"></div><div class="small-note" style="margin-bottom:4px;">Exam average by subject</div>`;
+        SUBJECTS.forEach(s=>{
+          const v = asmSubj[s];
+          if(v.pct==null) return;
+          html += `<div class="subj-row"><span>${s}</span><span class="mono">${Math.round(v.pct)}% (${v.count} test${v.count!==1?'s':''})</span></div>`;
+        });
+      }
+
       const narrative = buildStudentNarrative(name, p, bd, att, asm);
       if(narrative){
         html += `<div class="divider"></div>
@@ -1694,6 +1757,12 @@
     }
     if(asm && asm.count>0){
       parts.push(`Across ${asm.count} logged assessment${asm.count!==1?'s':''}, the average is ${Math.round(asm.pct)}%.`);
+      const subjPct = computeAssessmentSubjectPct(name);
+      const entries = SUBJECTS.map(s=>({s, pct:subjPct[s].pct})).filter(x=>x.pct!=null);
+      if(entries.length>1){
+        entries.sort((a,b)=>b.pct-a.pct);
+        parts.push(`In exams, ${entries[0].s} is the strongest subject (${Math.round(entries[0].pct)}%) and ${entries[entries.length-1].s} the weakest (${Math.round(entries[entries.length-1].pct)}%).`);
+      }
     }
     return parts.join(' ');
   }
@@ -1803,15 +1872,58 @@
     return { pct: total>0 ? (present/total*100) : 0, count: total, present };
   }
 
+  // Returns the max score for a given subject on an assessment — supports per-subject
+  // maxes (used by auto-published exam results, where subjects can have different
+  // question counts) with a uniform as.maxScore as the fallback for manually entered tests.
+  function subjectMaxFor(as, subject){
+    if(as.subjectMax && as.subjectMax[subject]!=null) return as.subjectMax[subject];
+    return as.maxScore;
+  }
+
   function computeAssessmentPct(name){
     let sum=0, count=0;
     (DB.assessments||[]).forEach(as=>{
-      if(as.scores && Object.prototype.hasOwnProperty.call(as.scores, name) && as.maxScore>0){
-        sum += (as.scores[name]/as.maxScore)*100;
+      if(!as.scores || !Object.prototype.hasOwnProperty.call(as.scores, name)) return;
+      const rec = as.scores[name];
+      if(typeof rec === 'number'){
+        // legacy: one total score out of maxScore
+        if(!(as.maxScore>0)) return;
+        sum += (rec/as.maxScore)*100;
         count++;
+      } else if(rec && typeof rec === 'object'){
+        // per-subject: each subject out of its own max, combined into one % for this assessment
+        let subjTotal=0, subjMax=0;
+        SUBJECTS.forEach(s=>{
+          const v = rec[s];
+          if(v!==undefined && v!==null && v!==''){
+            const mx = subjectMaxFor(as, s);
+            if(mx>0){ subjTotal += (parseFloat(v)||0); subjMax += mx; }
+          }
+        });
+        if(subjMax>0){ sum += (subjTotal/subjMax)*100; count++; }
       }
     });
     return { pct: count>0 ? sum/count : 0, count };
+  }
+
+  // Subject-wise exam average across all assessments, for report breakdowns and weak/strong-subject flags.
+  function computeAssessmentSubjectPct(name){
+    const out = {};
+    SUBJECTS.forEach(s=>{ out[s] = {sum:0, count:0}; });
+    (DB.assessments||[]).forEach(as=>{
+      const rec = as.scores ? as.scores[name] : undefined;
+      if(!rec || typeof rec !== 'object') return;
+      SUBJECTS.forEach(s=>{
+        const v = rec[s];
+        const mx = subjectMaxFor(as, s);
+        if(v!==undefined && v!==null && v!=='' && mx>0){
+          out[s].sum += (parseFloat(v)/mx)*100;
+          out[s].count++;
+        }
+      });
+    });
+    SUBJECTS.forEach(s=>{ out[s].pct = out[s].count>0 ? out[s].sum/out[s].count : null; });
+    return out;
   }
 
   function computeQuizPct(name, profiles){
@@ -1972,11 +2084,13 @@
 
   function renderMeetingsSection(){
     let html = `<div class="card">
-      <h2>Meetings &amp; attendance</h2>`;
+      <h2>Meetings &amp; attendance</h2>
+      <p class="sub">Add an online link (Google Meet, Zoom, YouTube Live, etc.) for remote sessions — it shows as a Join button here for everyone.</p>`;
     if(ui.isStaff){
       html += `<div class="row">
         <div><input type="text" id="f-meeting-name" placeholder="Meeting name (e.g. Tuesday training)"></div>
         <div><input type="date" id="f-meeting-date"></div>
+        <div style="flex:1.4;"><input type="text" id="f-meeting-link" placeholder="Session link (optional) — meet.google.com/…"></div>
         <div style="flex:0;"><button class="btn" data-add-meeting="1">Add meeting</button></div>
       </div>`;
     }
@@ -1990,11 +2104,14 @@
       const totalCount = Object.keys(mt.attendance||{}).length;
       const expanded = ui.expandedMeeting === mt.id;
       html += `<div class="t-list-item" data-toggle-meeting="${mt.id}">
-        <div><h3>${escapeHtml(mt.name)}</h3><p>${mt.date?mt.date+' · ':''}${presentCount}/${totalCount} present</p></div>
+        <div><h3>${escapeHtml(mt.name)}</h3><p>${mt.date?mt.date+' · ':''}${presentCount}/${totalCount} present${mt.link?' · online link attached':''}</p></div>
         <span class="pill">${expanded?'▾':'▸'}</span>
       </div>`;
       if(expanded){
         html += `<div class="card" style="background:var(--panel-2); margin-top:-4px; margin-bottom:14px;">`;
+        if(mt.link){
+          html += `<a href="${escapeAttr(mt.link)}" target="_blank" rel="noopener" class="btn btn-brass" style="display:inline-block; margin-bottom:12px; text-decoration:none;">↗ Join session</a>`;
+        }
         studentNames().slice().sort().forEach(name=>{
           const present = !!(mt.attendance && mt.attendance[name]);
           html += `<label class="checkbox-row" style="margin-bottom:8px;">
@@ -2014,11 +2131,12 @@
 
   function renderAssessmentsSection(){
     let html = `<div class="card">
-      <h2>Assessments &amp; exams</h2>`;
+      <h2>Assessments &amp; exams</h2>
+      <p class="sub">Score each subject separately — Biology, Chemistry, Physics, Mathematics — and it rolls up into the total and into each student's report.</p>`;
     if(ui.isStaff){
       html += `<div class="row">
-        <div><input type="text" id="f-assessment-name" placeholder="Test name (e.g. Biology Mock 1)"></div>
-        <div><label class="field">Max score</label><input type="number" id="f-assessment-max" min="1" value="100"></div>
+        <div><input type="text" id="f-assessment-name" placeholder="Test name (e.g. Mock Exam 1)"></div>
+        <div><label class="field">Max score per subject</label><input type="number" id="f-assessment-max" min="1" value="25"></div>
         <div><label class="field">Date</label><input type="date" id="f-assessment-date"></div>
         <div style="flex:0;"><button class="btn" data-add-assessment="1">Add assessment</button></div>
       </div>`;
@@ -2031,26 +2149,325 @@
     assessments.forEach(as=>{
       const count = Object.keys(as.scores||{}).length;
       const expanded = ui.expandedAssessment === as.id;
+      const totalMax = as.subjectMax
+        ? SUBJECTS.reduce((sum,s)=>sum+(subjectMaxFor(as,s)||0),0)
+        : (as.maxScore||0) * SUBJECTS.length;
+      const maxLabel = as.subjectMax
+        ? SUBJECTS.map(s=>`${s.slice(0,4)} /${subjectMaxFor(as,s)}`).join(' · ')
+        : `${as.maxScore} pts/subject`;
       html += `<div class="t-list-item" data-toggle-assessment="${as.id}">
-        <div><h3>${escapeHtml(as.name)}</h3><p>${as.date?as.date+' · ':''}out of ${as.maxScore} · ${count} scored</p></div>
+        <div><h3>${escapeHtml(as.name)}${as.fromExam?' <span class="pill gold">from exam</span>':''}</h3><p>${as.date?as.date+' · ':''}${maxLabel} · out of ${totalMax} total · ${count} scored</p></div>
         <span class="pill">${expanded?'▾':'▸'}</span>
       </div>`;
       if(expanded){
-        html += `<div class="card" style="background:var(--panel-2); margin-top:-4px; margin-bottom:14px;">`;
+        html += `<div class="card" style="background:var(--panel-2); margin-top:-4px; margin-bottom:14px; overflow-x:auto;">`;
+        if(as.fromExam){
+          html += `<p class="small-note" style="margin-bottom:10px;">Auto-filled from the "${escapeHtml(as.examTitle||'exam')}" live exam — scores here are read-only. To change an answer key or score, edit it on the Exams tab and republish.</p>`;
+        }
+        html += `<table><thead><tr><th>Student</th>${SUBJECTS.map(s=>`<th>${s.slice(0,4)}</th>`).join('')}<th>Total</th></tr></thead><tbody>`;
         studentNames().slice().sort().forEach(name=>{
-          const val = as.scores ? as.scores[name] : undefined;
-          html += `<div class="row" style="margin-bottom:8px; align-items:center;">
-            <div style="flex:2;">${escapeHtml(name)}</div>
-            <div style="max-width:100px;"><input type="number" min="0" max="${as.maxScore}" step="any" data-assessment-score="${as.id}|${escapeAttr(name)}" value="${val!==undefined?val:''}" ${ui.isStaff?'':'disabled'}></div>
-          </div>`;
+          const rec = as.scores ? as.scores[name] : undefined;
+          const isLegacy = typeof rec === 'number';
+          const subj = (rec && typeof rec === 'object') ? rec : {};
+          let rowTotal = 0, any = false;
+          const cells = SUBJECTS.map(s=>{
+            const v = subj[s];
+            const mx = subjectMaxFor(as, s);
+            if(v!==undefined && v!==null && v!==''){ rowTotal += parseFloat(v)||0; any = true; }
+            return `<td><input type="number" min="0" max="${mx}" step="any" data-assessment-score="${as.id}|${escapeAttr(name)}|${s}" value="${v!==undefined&&v!==null?v:''}" ${(ui.isStaff && !as.fromExam)?'':'disabled'} style="width:64px;"></td>`;
+          }).join('');
+          const totalDisplay = isLegacy ? rec : (any ? rowTotal : '—');
+          html += `<tr><td>${escapeHtml(name)}${isLegacy?' <span class="pill" title="Entered before subject-wise scoring — fill in the subjects above to replace it.">legacy total</span>':''}</td>${cells}<td class="mono">${totalDisplay}</td></tr>`;
         });
+        html += `</tbody></table>`;
         if(ui.isCoach){
-          html += `<button class="btn btn-sm btn-danger" data-delete-assessment="${as.id}" style="margin-top:6px;">Delete assessment</button>`;
+          html += `<button class="btn btn-sm btn-danger" data-delete-assessment="${as.id}" style="margin-top:10px;">Delete assessment</button>`;
         }
         html += `</div>`;
       }
     });
     html += `</div>`;
+    return html;
+  }
+
+  /* ============================= LIVE EXAMS ============================= */
+  function renderExams(){
+    if(ui.examAttempt) return renderExamTaking();
+    let html = `<h2 class="display" style="font-size:22px;">Exams</h2>
+      <p class="sub">Timed, auto-marked tests — multiple-choice, true/false, short answer, and numeric-with-units. Students answer from any device; scores publish straight into Squad reports.</p>`;
+    html += renderTakeExamCard();
+    if(ui.isStaff) html += renderExamManagement();
+    else html += `<div class="card"><p class="small-note">Exam creation and results are managed by staff. Got a code and PIN from your coach? Enter them above to start.</p></div>`;
+    return html;
+  }
+
+  function renderTakeExamCard(){
+    let html = `<div class="card">
+      <h2>Take an exam</h2>
+      <p class="sub">Enter the code and the personal PIN your coach gave you, then pick your name. Reopening this page with the same name and PIN resumes an exam already in progress; the clock keeps running either way.</p>`;
+    if(ui.examTakeError) html += `<div class="warn-box">${escapeHtml(ui.examTakeError)}</div>`;
+    html += `<div class="row">
+        <div><label class="field">Exam code</label><input type="text" id="f-take-code" placeholder="e.g. QX7K2" style="text-transform:uppercase;"></div>
+        <div><label class="field">Your name</label><select id="f-take-name">
+          <option value="">Select your name…</option>
+          ${studentNames().slice().sort().map(n=>`<option value="${escapeAttr(n)}">${escapeHtml(n)}</option>`).join('')}
+        </select></div>
+        <div><label class="field">Your PIN</label><input type="text" id="f-take-pin" placeholder="4-digit PIN" inputmode="numeric" maxlength="6" style="max-width:110px;"></div>
+        <div style="flex:0;"><button class="btn btn-brass" data-take-exam="1">Start / resume</button></div>
+      </div>
+    </div>`;
+    return html;
+  }
+
+  function renderExamManagement(){
+    let html = `<div class="card">
+      <div class="flex-between">
+        <h2 style="margin:0;">Manage exams</h2>
+        <button class="btn btn-sm ${ui.examBuilderOpen?'btn-brass':''}" data-toggle-exam-builder="1">${ui.examBuilderOpen?'▾ Close':'+ New exam'}</button>
+      </div>`;
+    if(ui.examBuilderOpen){
+      html += `<div class="row" style="margin-top:10px;">
+        <div><input type="text" id="f-exam-title" placeholder="Exam title (e.g. Biology Take-Home Test 1)"></div>
+        <div><label class="field">Time limit (minutes)</label><input type="number" id="f-exam-minutes" min="1" value="30"></div>
+      </div>
+      <div class="row" style="margin-top:8px; align-items:center;">
+        <div style="flex:0; display:flex; align-items:center; gap:6px;"><input type="checkbox" id="f-exam-negmark" checked style="width:auto;"><label for="f-exam-negmark" style="margin:0; font-size:13px;">Penalize wrong MCQ / True-or-False answers</label></div>
+        <div style="max-width:100px;"><input type="number" id="f-exam-negpenalty" value="1" min="0" step="0.5" title="Points deducted per wrong MCQ/True-False answer"></div>
+        <div style="flex:0; display:flex; align-items:center; gap:6px;"><input type="checkbox" id="f-exam-shuffle" checked style="width:auto;"><label for="f-exam-shuffle" style="margin:0; font-size:13px;">Shuffle question &amp; option order per student</label></div>
+      </div>
+      <p class="small-note" style="margin-top:6px;">Short-answer and numeric questions are never penalized for a wrong answer, whatever this is set to.</p>
+      <div class="row" style="margin-top:8px;"><div style="flex:0;"><button class="btn btn-brass" data-create-exam="1">Create</button></div></div>`;
+    }
+    html += `</div>`;
+
+    const exams = (DB.exams||[]).slice().sort((a,b)=>b.createdAt-a.createdAt);
+    if(exams.length===0){
+      html += `<div class="empty card"><div class="display">No exams yet</div><p>Create one above to get started.</p></div>`;
+    }
+    exams.forEach(ex=>{ html += renderExamListItem(ex); });
+    return html;
+  }
+
+  const QTYPE_LABELS = { mcq:'Multiple choice', true_false:'True / False', short:'Short answer', numeric:'Numeric (with units)' };
+
+  function renderQuestionSummary(qq){
+    let detail = '';
+    if(qq.type==='mcq' || qq.type==='true_false'){
+      detail = `Correct: ${escapeHtml((qq.options||[])[qq.correctIndex]||'')}`;
+    } else if(qq.type==='short'){
+      detail = `Accepted: ${(qq.acceptedAnswers||[]).map(escapeHtml).join(', ')}`;
+    } else if(qq.type==='numeric'){
+      const units = (qq.units||[]).join(' / ');
+      detail = `Answer: ${qq.correctValue}${qq.tolerance?` (±${qq.tolerance})`:''}${qq.unitRequired && units ? ' '+escapeHtml(units) : (qq.unitRequired?' — unit required':' — unit optional')}`;
+    }
+    return `<span class="pill">${escapeHtml(qq.subject)}</span> <span class="pill" style="opacity:.75;">${QTYPE_LABELS[qq.type]||qq.type}</span> <span style="font-size:13px;">${escapeHtml(qq.text)}</span>
+      <div class="small-note" style="margin-top:2px;">${detail} · ${qq.points||1} pt${(qq.points||1)!==1?'s':''}${(qq.type==='mcq'||qq.type==='true_false')?'':' · no penalty if wrong'}</div>`;
+  }
+
+  function renderExamListItem(ex){
+    const expanded = ui.expandedExamId === ex.id;
+    const qCount = (ex.questions||[]).length;
+    const badgeCls = ex.status==='open' ? 'status-live' : (ex.status==='closed' ? 'status-done' : '');
+    let html = `<div class="t-list-item" data-toggle-exam="${ex.id}">
+      <div><h3>${escapeHtml(ex.title)}</h3><p>${qCount} question${qCount!==1?'s':''} · ${ex.timeLimitMinutes} min${ex.publishedAssessmentId?' · published to reports':''}</p></div>
+      <div style="display:flex; align-items:center; gap:8px;">
+        <span class="status-badge ${badgeCls}">${ex.status}</span>
+        <span class="pill">${expanded?'▾':'▸'}</span>
+      </div>
+    </div>`;
+    if(!expanded) return html;
+
+    html += `<div class="card" style="background:var(--panel-2); margin-top:-4px; margin-bottom:14px;">`;
+    html += `<div class="row" style="align-items:center;">
+      <div><span class="pill gold mono" style="font-size:14px;">${ex.code}</span> <span class="small-note">exam code — share with the group</span></div>
+    </div>`;
+    html += `<div class="row" style="margin-top:10px;">`;
+    if(ex.status==='draft') html += `<div style="flex:0;"><button class="btn btn-sm btn-brass" data-exam-open="${ex.id}">Open exam (students can start)</button></div>`;
+    if(ex.status==='open') html += `<div style="flex:0;"><button class="btn btn-sm" data-exam-close="${ex.id}">Close (stop new starts)</button></div>`;
+    if(ex.status==='closed') html += `<div style="flex:0;"><button class="btn btn-sm" data-exam-open="${ex.id}">Reopen</button></div>`;
+    html += `<div style="flex:0;"><button class="btn btn-sm" data-exam-gen-pins="${ex.id}">${ex.studentPins && Object.keys(ex.studentPins).length ? 'Refresh' : 'Generate'} student PINs</button></div>`;
+    if(ui.isCoach) html += `<div style="flex:0;"><button class="btn btn-sm btn-danger" data-exam-delete="${ex.id}">Delete exam</button></div>`;
+    html += `</div>`;
+
+    if(ex.studentPins && Object.keys(ex.studentPins).length){
+      html += `<details style="margin-top:10px;"><summary class="small-note" style="cursor:pointer;">Show student PINs (${Object.keys(ex.studentPins).length}) — send each privately, not in a group chat</summary>
+        <div style="margin-top:8px; max-height:220px; overflow-y:auto;">
+        <table><thead><tr><th>Student</th><th>PIN</th></tr></thead><tbody>
+        ${Object.keys(ex.studentPins).sort().map(n=>`<tr><td>${escapeHtml(n)}</td><td class="mono">${escapeHtml(ex.studentPins[n])}</td></tr>`).join('')}
+        </tbody></table></div>
+      </details>`;
+    } else {
+      html += `<p class="small-note" style="margin-top:8px;">No PINs generated yet — click "Generate student PINs" and DM each student their own PIN before opening the exam. This is what stops someone else from writing under a classmate's name.</p>`;
+    }
+
+    html += `<div class="divider"></div><h3 class="display" style="font-size:14px;margin:0 0 8px;">Questions</h3>`;
+    (ex.questions||[]).forEach(qq=>{
+      html += `<div class="row" style="align-items:flex-start; margin-bottom:8px;">
+        <div style="flex:1;">${renderQuestionSummary(qq)}</div>
+        <div style="flex:0;"><button class="btn btn-sm btn-danger" data-exam-delete-question="${ex.id}|${qq.id}">✕</button></div>
+      </div>`;
+    });
+    if(qCount===0) html += `<p class="small-note">No questions yet — add the first one below.</p>`;
+
+    html += renderQuestionBuilder(ex.id);
+
+    html += `<div class="divider"></div>
+      <div class="flex-between">
+        <h3 class="display" style="font-size:14px;margin:0;">Live results</h3>
+        <button class="btn btn-sm btn-ghost" data-exam-refresh-results="${ex.id}">↻ Refresh</button>
+      </div>`;
+    if(ui.examMonitor && ui.examMonitor.examId===ex.id){
+      const mon = ui.examMonitor;
+      html += `<p class="small-note" style="margin:6px 0;">${mon.submittedCount} of ${DB.students.length} submitted${mon.avg!=null?` · average ${Math.round(mon.avg)}%`:''}${mon.pendingCount?` · <strong>${mon.pendingCount} answer${mon.pendingCount!==1?'s':''} need review</strong>`:''}</p>`;
+      html += `<table><thead><tr><th>Student</th><th>Status</th><th>Score</th></tr></thead><tbody>`;
+      mon.rows.slice().sort((a,b)=>a.name.localeCompare(b.name)).forEach(r=>{
+        html += `<tr><td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.status)}</td><td class="mono">${r.score!=null?r.score+'/'+r.maxScore+(r.pending?' *':''):'—'}</td></tr>`;
+      });
+      html += `</tbody></table>`;
+      if(mon.pendingCount>0) html += `<p class="small-note" style="margin-top:4px;">* provisional — includes unreviewed short-answer/numeric responses</p>`;
+      html += `<div class="row" style="margin-top:10px;">
+        <div style="flex:0;"><button class="btn btn-sm ${mon.pendingCount?'btn-brass':''}" data-exam-review="${ex.id}">Review ${mon.pendingCount?`(${mon.pendingCount})`:'answers'}</button></div>
+        <div style="flex:0;"><button class="btn btn-sm btn-brass" data-exam-publish="${ex.id}">${ex.publishedAssessmentId?'Republish':'Publish'} scores to Assessments</button></div>
+      </div>`;
+    } else {
+      html += `<p class="small-note">Tap Refresh to load live scores.</p>`;
+    }
+
+    if(ui.examReview && ui.examReview.examId===ex.id){
+      html += `<div class="divider"></div><h3 class="display" style="font-size:14px;margin:0 0 8px;">Needs review</h3>`;
+      if(ui.examReview.items.length===0){
+        html += `<p class="small-note">Nothing pending — every short-answer and numeric response has been matched automatically.</p>`;
+      }
+      ui.examReview.items.forEach(it=>{
+        html += `<div class="card" style="background:var(--panel); margin-bottom:8px;">
+          <p class="small-note" style="margin:0 0 4px;">${escapeHtml(it.studentName)} · ${escapeHtml(it.subject)} · ${it.points} pt${it.points!==1?'s':''}</p>
+          <p style="margin:0 0 4px; font-size:13px;">${escapeHtml(it.questionText)}</p>
+          <p style="margin:0 0 4px;"><strong>Answered:</strong> ${escapeHtml(String(it.rawAnswer||'(blank)'))}</p>
+          ${it.acceptedAnswers ? `<p class="small-note" style="margin:0 0 4px;">Accepted: ${it.acceptedAnswers.map(escapeHtml).join(', ')}</p>` : ''}
+          ${it.hint ? `<p class="small-note" style="margin:0 0 4px; color:var(--brass-soft);">${escapeHtml(it.hint)}</p>` : ''}
+          <div class="row"><div style="flex:0;"><button class="btn btn-sm btn-brass" data-exam-review-decide="${ex.id}|${escapeAttr(it.studentName)}|${it.qid}|correct">✓ Correct</button></div>
+          <div style="flex:0;"><button class="btn btn-sm" data-exam-review-decide="${ex.id}|${escapeAttr(it.studentName)}|${it.qid}|incorrect">✕ Incorrect</button></div></div>
+        </div>`;
+      });
+    }
+
+    html += `</div>`;
+    return html;
+  }
+
+  function renderQuestionBuilder(examId){
+    const opts4 = [0,1,2,3];
+    let html = `<div class="divider"></div><h3 class="display" style="font-size:14px;margin:0 0 8px;">Add a question</h3>
+      <div class="row">
+        <div><label class="field">Type</label><select id="f-eq-type-${examId}" data-eq-type-select="${examId}">
+          <option value="mcq">Multiple choice</option>
+          <option value="true_false">True / False</option>
+          <option value="short">Short answer (one/few words)</option>
+          <option value="numeric">Numeric — with units</option>
+        </select></div>
+        <div><label class="field">Subject</label><select id="f-eq-subject-${examId}">${SUBJECTS.map(s=>`<option value="${escapeAttr(s)}">${escapeHtml(s)}</option>`).join('')}</select></div>
+        <div><label class="field">Points</label><input type="number" id="f-eq-points-${examId}" min="1" value="1" style="max-width:80px;"></div>
+      </div>
+      <div style="margin-top:8px;"><textarea id="f-eq-text-${examId}" rows="2" placeholder="Question text"></textarea></div>`;
+
+    // MCQ group
+    html += `<div id="eq-group-mcq-${examId}">`;
+    opts4.forEach(i=>{
+      html += `<div class="row" style="margin-top:6px; align-items:center;">
+        <div style="flex:0;"><input type="radio" name="f-eq-correct-${examId}" value="${i}" id="f-eq-correct-${examId}-${i}"></div>
+        <div><input type="text" id="f-eq-opt-${examId}-${i}" placeholder="Option ${i+1}"></div>
+      </div>`;
+    });
+    html += `<p class="small-note" style="margin-top:4px;">Tick the radio next to the correct option.</p></div>`;
+
+    // True/False group
+    html += `<div id="eq-group-true_false-${examId}" style="display:none;">
+      <div class="row" style="margin-top:6px;">
+        <div style="flex:0; display:flex; align-items:center; gap:6px;"><input type="radio" name="f-eq-tf-${examId}" value="0" id="f-eq-tf-${examId}-0"><label for="f-eq-tf-${examId}-0" style="margin:0;">True is correct</label></div>
+        <div style="flex:0; display:flex; align-items:center; gap:6px;"><input type="radio" name="f-eq-tf-${examId}" value="1" id="f-eq-tf-${examId}-1"><label for="f-eq-tf-${examId}-1" style="margin:0;">False is correct</label></div>
+      </div>
+    </div>`;
+
+    // Short answer group
+    html += `<div id="eq-group-short-${examId}" style="display:none;">
+      <div style="margin-top:6px;"><input type="text" id="f-eq-short-accepted-${examId}" placeholder="Accepted answers, separated by | (e.g. mitochondria | mitochondrion)"></div>
+      <p class="small-note" style="margin-top:4px;">Marking is case/spacing-insensitive. Close-but-not-exact answers are queued for you to approve rather than auto-failed.</p>
+    </div>`;
+
+    // Numeric group
+    html += `<div id="eq-group-numeric-${examId}" style="display:none;">
+      <div class="row" style="margin-top:6px;">
+        <div><label class="field">Correct value</label><input type="number" step="any" id="f-eq-num-value-${examId}" placeholder="e.g. 5"></div>
+        <div><label class="field">Tolerance (±)</label><input type="number" step="any" min="0" value="0" id="f-eq-num-tol-${examId}"></div>
+      </div>
+      <div style="margin-top:6px;"><input type="text" id="f-eq-num-units-${examId}" placeholder="Accepted units, separated by | (e.g. m^2 | m2 | sqm)"></div>
+      <div class="row" style="margin-top:6px; align-items:center;">
+        <div style="flex:0; display:flex; align-items:center; gap:6px;"><input type="checkbox" id="f-eq-num-unitreq-${examId}" checked style="width:auto;"><label for="f-eq-num-unitreq-${examId}" style="margin:0; font-size:13px;">Unit required (a bare number is marked wrong)</label></div>
+      </div>
+    </div>`;
+
+    html += `<button class="btn btn-sm" style="margin-top:10px;" data-exam-add-question="${examId}">Add question</button>`;
+    return html;
+  }
+
+  function renderExamTaking(){
+    const {exam, name, record} = ui.examAttempt;
+    if(record.submitted){
+      const provisional = record.pending && record.pending.length>0;
+      return `<div class="card" style="text-align:center;">
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;">${escapeHtml(exam.title)}</div>
+        <div class="display" style="font-size:28px;color:var(--brass-soft);margin:8px 0;">${record.score} / ${record.maxScore}${provisional?' *':''}</div>
+        <p class="sub">${escapeHtml(name)}${record.autoSubmitted?' · time expired, auto-submitted':' · submitted'}</p>
+        ${provisional?`<p class="small-note">* ${record.pending.length} answer${record.pending.length!==1?'s':''} still need${record.pending.length===1?'s':''} your coach's review — this score may change.</p>`:''}
+        <button class="btn" data-exit-exam="1" style="margin-top:10px;">Done</button>
+      </div>`;
+    }
+    let html = `<div class="card">
+      <div class="flex-between">
+        <div>
+          <h2 style="margin:0;">${escapeHtml(exam.title)}</h2>
+          <p class="sub" style="margin:2px 0 0;">${escapeHtml(name)}</p>
+        </div>
+        <div style="text-align:right;">
+          <div style="font-size:11px;color:var(--muted);text-transform:uppercase;">Time left</div>
+          <div id="exam-timer-display" class="mono" style="font-size:22px;color:var(--brass-soft);">${formatMs(ui.examAttempt.remainingMs)}</div>
+        </div>
+      </div>
+    </div>`;
+
+    const qOrder = getShuffledQuestionOrder(exam, name);
+    const byId = {}; (exam.questions||[]).forEach(qq=>{ byId[qq.id]=qq; });
+    qOrder.forEach((qid,i)=>{
+      const qq = byId[qid];
+      if(!qq) return;
+      const chosen = record.answers ? record.answers[qq.id] : undefined;
+      html += `<div class="card">
+        <p class="small-note" style="margin-bottom:2px;">Question ${i+1} of ${qOrder.length} · ${escapeHtml(qq.subject)} · ${qq.points||1} pt${(qq.points||1)!==1?'s':''}${(qq.type==='mcq'||qq.type==='true_false')?'':' · no penalty if wrong'}</p>
+        <p style="font-weight:600; margin:4px 0 10px;">${escapeHtml(qq.text)}</p>`;
+      if(qq.type==='mcq' || qq.type==='true_false'){
+        const order = getShuffledOptionOrder(exam, name, qq);
+        order.forEach(oi=>{
+          const opt = qq.options[oi];
+          const checked = chosen===oi;
+          html += `<label style="display:flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid var(--hair); border-radius:7px; margin-bottom:6px; cursor:pointer; background:${checked?'var(--panel-2)':'transparent'};">
+            <input type="radio" name="q-${qq.id}" value="${oi}" data-exam-answer="${qq.id}" data-exam-answer-kind="choice" ${checked?'checked':''}>
+            <span>${escapeHtml(opt)}</span>
+          </label>`;
+        });
+      } else if(qq.type==='short'){
+        html += `<input type="text" placeholder="Your answer" data-exam-answer="${qq.id}" data-exam-answer-kind="text" value="${escapeAttr(chosen||'')}">`;
+      } else if(qq.type==='numeric'){
+        html += `<input type="text" placeholder="e.g. 5m^2 — include the unit" data-exam-answer="${qq.id}" data-exam-answer-kind="text" value="${escapeAttr(chosen||'')}">
+          <p class="small-note" style="margin-top:4px;">Include the unit with your answer.</p>`;
+      }
+      html += `</div>`;
+    });
+
+    const answeredCount = Object.keys(record.answers||{}).length;
+    html += `<div class="card" style="text-align:center;">
+      <p class="small-note" id="exam-progress">${answeredCount} of ${qOrder.length} answered</p>
+      <button class="btn btn-brass" data-submit-exam="1">Submit exam</button>
+    </div>`;
     return html;
   }
 
@@ -2206,6 +2623,12 @@
     if(editAddGuestInput) editAddGuestInput.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); addGuestCompetitorToSetup(); } });
     qa('[data-reset-fixture]').forEach(el=>el.addEventListener('click', ()=>{
       resetFixtureForStage(parseInt(el.getAttribute('data-reset-fixture')));
+    }));
+    qa('[data-add-substitute]').forEach(el=>el.addEventListener('click', ()=>{
+      addSubstituteToStage(parseInt(el.getAttribute('data-add-substitute')), false);
+    }));
+    qa('[data-add-substitute-guest]').forEach(el=>el.addEventListener('click', ()=>{
+      addSubstituteToStage(parseInt(el.getAttribute('data-add-substitute-guest')), true);
     }));
 
     qa('[data-slot-edit]').forEach(el=>el.addEventListener('change', e=>{
@@ -2383,12 +2806,85 @@
       render();
     }));
     qa('[data-assessment-score]').forEach(el=>el.addEventListener('change', e=>{
-      const [asId, name] = el.getAttribute('data-assessment-score').split('|');
-      saveAssessmentScore(asId, name, e.target.value);
+      const [asId, name, subject] = el.getAttribute('data-assessment-score').split('|');
+      saveAssessmentScore(asId, name, subject, e.target.value);
     }));
     qa('[data-delete-assessment]').forEach(el=>el.addEventListener('click', ()=>{
       const id = el.getAttribute('data-delete-assessment');
       openConfirm('Delete this assessment?', 'This removes all recorded scores for it permanently.', ()=>deleteAssessment(id));
+    }));
+
+    // Live exams — take/resume
+    qa('[data-take-exam]').forEach(el=>el.addEventListener('click', startOrResumeExam));
+    qa('[data-exit-exam]').forEach(el=>el.addEventListener('click', exitExamAttempt));
+    qa('[data-exam-answer]').forEach(el=>{
+      const kind = el.getAttribute('data-exam-answer-kind');
+      const evt = kind==='text' ? 'input' : 'change';
+      el.addEventListener(evt, e=>{
+        const val = kind==='text' ? e.target.value : parseInt(e.target.value);
+        recordExamAnswer(el.getAttribute('data-exam-answer'), val);
+      });
+    });
+    qa('[data-submit-exam]').forEach(el=>el.addEventListener('click', ()=>{
+      openConfirm('Submit this exam?', "You can't change your answers after submitting.", ()=>submitExamAttempt(false));
+    }));
+
+    // Live exams — staff management
+    const toggleExamBuilderBtn = q('[data-toggle-exam-builder]');
+    if(toggleExamBuilderBtn) toggleExamBuilderBtn.addEventListener('click', ()=>{
+      ui.examBuilderOpen = !ui.examBuilderOpen;
+      render();
+    });
+    const createExamBtn = q('[data-create-exam]');
+    if(createExamBtn) createExamBtn.addEventListener('click', createExam);
+    qa('[data-eq-type-select]').forEach(el=>el.addEventListener('change', ()=>{
+      const examId = el.getAttribute('data-eq-type-select');
+      ['mcq','true_false','short','numeric'].forEach(t=>{
+        const grp = document.getElementById(`eq-group-${t}-${examId}`);
+        if(grp) grp.style.display = (t===el.value) ? '' : 'none';
+      });
+    }));
+    qa('[data-toggle-exam]').forEach(el=>el.addEventListener('click', ()=>{
+      const id = el.getAttribute('data-toggle-exam');
+      ui.expandedExamId = (ui.expandedExamId===id) ? null : id;
+      ui.examMonitor = null;
+      ui.examReview = null;
+      render();
+    }));
+    qa('[data-exam-open]').forEach(el=>el.addEventListener('click', ()=>{
+      setExamStatus(el.getAttribute('data-exam-open'), 'open');
+    }));
+    qa('[data-exam-close]').forEach(el=>el.addEventListener('click', ()=>{
+      setExamStatus(el.getAttribute('data-exam-close'), 'closed');
+    }));
+    qa('[data-exam-delete]').forEach(el=>el.addEventListener('click', ()=>{
+      const id = el.getAttribute('data-exam-delete');
+      openConfirm('Delete this exam?', 'This removes the exam, its questions, and every student attempt permanently.', ()=>deleteExam(id));
+    }));
+    qa('[data-exam-gen-pins]').forEach(el=>el.addEventListener('click', ()=>{
+      const id = el.getAttribute('data-exam-gen-pins');
+      openConfirm('Generate student PINs?', 'This assigns (or reassigns) a private PIN to every current student for this exam. Share each one individually — not in a group chat — or anyone with the exam code could start under someone else\'s name.', ()=>generateExamPins(id));
+    }));
+    qa('[data-exam-add-question]').forEach(el=>el.addEventListener('click', ()=>{
+      addExamQuestion(el.getAttribute('data-exam-add-question'));
+    }));
+    qa('[data-exam-delete-question]').forEach(el=>el.addEventListener('click', ()=>{
+      const [examId, qid] = el.getAttribute('data-exam-delete-question').split('|');
+      deleteExamQuestion(examId, qid);
+    }));
+    qa('[data-exam-refresh-results]').forEach(el=>el.addEventListener('click', ()=>{
+      refreshExamResults(el.getAttribute('data-exam-refresh-results'));
+    }));
+    qa('[data-exam-review]').forEach(el=>el.addEventListener('click', ()=>{
+      loadPendingReviewsIntoUi(el.getAttribute('data-exam-review'));
+    }));
+    qa('[data-exam-review-decide]').forEach(el=>el.addEventListener('click', ()=>{
+      const [examId, studentName, qid, decision] = el.getAttribute('data-exam-review-decide').split('|');
+      resolvePendingReview(examId, studentName, qid, decision);
+    }));
+    qa('[data-exam-publish]').forEach(el=>el.addEventListener('click', ()=>{
+      const id = el.getAttribute('data-exam-publish');
+      openConfirm('Publish scores to Assessments?', "This adds (or replaces) an assessment entry from this exam's submitted attempts, feeding student reports and selection scores.", ()=>publishExamToAssessments(id));
     }));
 
     // modal
@@ -2685,6 +3181,30 @@
     render();
   }
 
+  async function addSubstituteToStage(stageIdx, isGuest){
+    if(!ui.isStaff){ alert('Staff or coach access is required to add a substitute.'); return; }
+    const t = currentTournament;
+    const stage = t.stages[stageIdx];
+    let name;
+    if(isGuest){
+      const input = q(`#f-sub-add-guest-${stageIdx}`);
+      name = (input ? input.value : '').trim();
+    } else {
+      const sel = q(`#f-sub-add-name-${stageIdx}`);
+      name = sel ? sel.value : '';
+    }
+    if(!name){ toast('Pick or type a name first.', 'error'); return; }
+    let comp = isGuest ? null : t.competitors.find(c=>c.name===name);
+    if(!comp){
+      comp = { id: uid('c'), name, seed:false, type: isGuest?'guest':'individual' };
+      t.competitors.push(comp);
+    }
+    if(!stage.competitorIds.includes(comp.id)) stage.competitorIds.push(comp.id);
+    saveCurrentTournament();
+    toast(`${name} added — use the seat dropdown on a match below to swap them in for the absent contestant.`, 'success');
+    render();
+  }
+
   async function ballotSeats(mi){
     if(!ui.isStaff){ toast('Staff or coach access is required.', 'error'); return; }
     const stage = currentTournament.stages[currentTournament.currentStageIndex];
@@ -2753,6 +3273,8 @@
   async function resetEverything(){
     if(!ui.isCoach){ alert('Coach mode is required.'); return; }
     for(const t of DB.tIndex){ await sDelete('tournament:'+t.id); }
+    const prevStudents = DB.students.slice();
+    const prevExams = (DB.exams||[]).slice();
     DB.tIndex = [];
     DB.students = [];
     DB.fullCache = [];
@@ -2760,12 +3282,17 @@
     DB.assessments = [];
     DB.notes = {};
     DB.weights = {attendance:30, assessment:30, quiz:40};
+    for(const ex of prevExams){
+      for(const s of prevStudents){ await sDelete(`exam_attempt:${ex.id}:${s.name}`); }
+    }
+    DB.exams = [];
     await sSet('tournament_index', []);
     await sSet('students', []);
     await sSet('meetings', []);
     await sSet('assessments', []);
     await sSet('student_notes', {});
     await sSet('selection_weights', DB.weights);
+    await sSet('exams', []);
     currentTournament = null;
     ui.view = 'home';
     render();
@@ -2822,12 +3349,14 @@
     if(!ui.isStaff) return;
     const nameEl = q('#f-meeting-name');
     const dateEl = q('#f-meeting-date');
+    const linkEl = q('#f-meeting-link');
     const name = (nameEl ? nameEl.value : '').trim();
     if(!name){ toast('Enter a meeting name.', 'error'); return; }
     const date = dateEl ? dateEl.value : '';
+    const link = (linkEl ? linkEl.value : '').trim();
     const attendance = {};
     studentNames().forEach(n=>{ attendance[n] = false; });
-    const mt = { id: uid('mt'), name, date, createdAt: Date.now(), attendance };
+    const mt = { id: uid('mt'), name, date, link, createdAt: Date.now(), attendance };
     DB.meetings.push(mt);
     sSet('meetings', DB.meetings);
     ui.expandedMeeting = mt.id;
@@ -2858,7 +3387,7 @@
     const dateEl = q('#f-assessment-date');
     const name = (nameEl ? nameEl.value : '').trim();
     if(!name){ toast('Enter a test name.', 'error'); return; }
-    const max = maxEl ? (parseFloat(maxEl.value)||100) : 100;
+    const max = maxEl ? (parseFloat(maxEl.value)||25) : 25;
     const date = dateEl ? dateEl.value : '';
     const as = { id: uid('as'), name, maxScore:max, date, createdAt: Date.now(), scores:{} };
     DB.assessments.push(as);
@@ -2867,13 +3396,16 @@
     render();
   }
 
-  async function saveAssessmentScore(asId, name, value){
+  async function saveAssessmentScore(asId, name, subject, value){
     if(!ui.isStaff) return;
     const as = DB.assessments.find(a=>a.id===asId);
-    if(!as) return;
+    if(!as || as.fromExam) return;
     if(!as.scores) as.scores = {};
-    if(value===''||value==null) delete as.scores[name];
-    else as.scores[name] = parseFloat(value);
+    // migrate a legacy single-number entry to the new per-subject shape as soon as it's touched
+    if(typeof as.scores[name] !== 'object' || as.scores[name]===null) as.scores[name] = {};
+    if(value===''||value==null) delete as.scores[name][subject];
+    else as.scores[name][subject] = parseFloat(value);
+    if(Object.keys(as.scores[name]).length===0) delete as.scores[name];
     sSet('assessments', DB.assessments);
   }
 
@@ -2882,6 +3414,435 @@
     DB.assessments = DB.assessments.filter(a=>a.id!==id);
     sSet('assessments', DB.assessments);
     ui.expandedAssessment = null;
+    render();
+  }
+
+  /* ============================= LIVE EXAMS: GRADING HELPERS ============================= */
+  function normalizeText(s){
+    return String(s||'').trim().toLowerCase().replace(/[.\s]+$/,'').replace(/\s+/g,' ');
+  }
+  function normalizeUnit(s){
+    return String(s||'').toLowerCase().replace(/\s+/g,'').replace(/\^/g,'');
+  }
+  function levenshtein(a,b){
+    const m=a.length, n=b.length;
+    const dp = Array.from({length:m+1}, ()=>new Array(n+1).fill(0));
+    for(let i=0;i<=m;i++) dp[i][0]=i;
+    for(let j=0;j<=n;j++) dp[0][j]=j;
+    for(let i=1;i<=m;i++) for(let j=1;j<=n;j++){
+      dp[i][j] = a[i-1]===b[j-1] ? dp[i-1][j-1] : 1+Math.min(dp[i-1][j-1], dp[i-1][j], dp[i][j-1]);
+    }
+    return dp[m][n];
+  }
+  function gradeQuestionAnswer(question, rawAnswer, negativeMarking, negativePenalty){
+    const pts = question.points||1;
+    if(question.type==='mcq' || question.type==='true_false'){
+      if(rawAnswer===undefined || rawAnswer===null || rawAnswer==='') return {status:'unanswered', earned:0};
+      if(parseInt(rawAnswer)===question.correctIndex) return {status:'correct', earned:pts};
+      return {status:'incorrect', earned: negativeMarking ? -(negativePenalty!=null?negativePenalty:1) : 0};
+    }
+    if(question.type==='short'){
+      const raw = (rawAnswer||'').toString();
+      if(!raw.trim()) return {status:'unanswered', earned:0};
+      const norm = normalizeText(raw);
+      const accepted = (question.acceptedAnswers||[]).map(normalizeText);
+      if(accepted.includes(norm)) return {status:'correct', earned:pts};
+      let closest=null, closestDist=Infinity;
+      accepted.forEach(a=>{ const d=levenshtein(norm,a); if(d<closestDist){ closestDist=d; closest=a; } });
+      const threshold = closest!==null ? Math.max(1, Math.round(closest.length*0.2)) : 0;
+      if(closest!==null && closestDist<=threshold){
+        return {status:'pending', earned:0, hint:`Close to "${closest}" — possible typo, check manually`};
+      }
+      return {status:'pending', earned:0, hint:'No exact match on file — review manually'};
+    }
+    if(question.type==='numeric'){
+      const raw = (rawAnswer||'').toString().trim();
+      if(!raw) return {status:'unanswered', earned:0};
+      const m = raw.match(/^(-?\d+(?:\.\d+)?)\s*(.*)$/);
+      if(!m) return {status:'pending', earned:0, hint:"Couldn't read a number from this answer — review manually"};
+      const val = parseFloat(m[1]);
+      const tol = question.tolerance||0;
+      const valOk = Math.abs(val - question.correctValue) <= tol;
+      if(!valOk) return {status:'incorrect', earned:0};
+      if(question.unitRequired){
+        const acceptedUnits = (question.units||[]).map(normalizeUnit).filter(Boolean);
+        const unitPart = normalizeUnit(m[2]);
+        if(acceptedUnits.length===0) return {status:'pending', earned:0, hint:'No accepted units configured for this question — review manually'};
+        if(!unitPart) return {status:'incorrect', earned:0}; // right number, missing unit -> wrong, per NSMQ-style marking
+        if(!acceptedUnits.includes(unitPart)) return {status:'pending', earned:0, hint:`Unit "${m[2].trim()}" isn't in the accepted list — check manually`};
+      }
+      return {status:'correct', earned:pts};
+    }
+    return {status:'pending', earned:0, hint:'Unknown question type'};
+  }
+
+  function seededRandom(seedStr){
+    let h = 0;
+    for(let i=0;i<seedStr.length;i++){ h = (h*31 + seedStr.charCodeAt(i))|0; }
+    return function(){
+      h = (h*1103515245 + 12345) & 0x7fffffff;
+      return h / 0x7fffffff;
+    };
+  }
+  function seededShuffle(arr, seedStr){
+    const rand = seededRandom(seedStr);
+    const a = arr.slice();
+    for(let i=a.length-1;i>0;i--){
+      const j = Math.floor(rand()*(i+1));
+      [a[i],a[j]] = [a[j],a[i]];
+    }
+    return a;
+  }
+  function getShuffledQuestionOrder(exam, name){
+    const ids = (exam.questions||[]).map(qq=>qq.id);
+    if(!exam.shuffleQuestions) return ids;
+    return seededShuffle(ids, exam.id+'|'+name+'|q');
+  }
+  function getShuffledOptionOrder(exam, name, question){
+    const idxs = (question.options||[]).map((_,i)=>i);
+    if(!exam.shuffleQuestions) return idxs;
+    return seededShuffle(idxs, exam.id+'|'+name+'|o|'+question.id);
+  }
+  function generatePin(){
+    return String(Math.floor(1000 + Math.random()*9000));
+  }
+
+  /* ============================= LIVE EXAMS: STAFF ACTIONS ============================= */
+  async function createExam(){
+    if(!ui.isStaff) return;
+    const titleEl = q('#f-exam-title');
+    const minEl = q('#f-exam-minutes');
+    const negMarkEl = q('#f-exam-negmark');
+    const negPenEl = q('#f-exam-negpenalty');
+    const shuffleEl = q('#f-exam-shuffle');
+    const title = (titleEl ? titleEl.value : '').trim();
+    if(!title){ toast('Give the exam a title.', 'error'); return; }
+    const minutes = minEl ? (parseInt(minEl.value)||30) : 30;
+    const negativeMarking = negMarkEl ? !!negMarkEl.checked : true;
+    const negativePenalty = negPenEl ? (parseFloat(negPenEl.value)||1) : 1;
+    const shuffleQuestions = shuffleEl ? !!shuffleEl.checked : true;
+    const ex = { id: uid('exam'), title, code: genExamCode(), timeLimitMinutes: minutes, status:'draft', createdAt: Date.now(), questions: [], publishedAssessmentId: null, negativeMarking, negativePenalty, shuffleQuestions, studentPins: {} };
+    if(!DB.exams) DB.exams = [];
+    DB.exams.push(ex);
+    await sSet('exams', DB.exams);
+    ui.examBuilderOpen = false;
+    ui.expandedExamId = ex.id;
+    render();
+  }
+
+  async function generateExamPins(examId){
+    if(!ui.isStaff) return;
+    const ex = (DB.exams||[]).find(e=>e.id===examId);
+    if(!ex) return;
+    if(!ex.studentPins) ex.studentPins = {};
+    DB.students.forEach(s=>{ ex.studentPins[s.name] = generatePin(); });
+    await sSet('exams', DB.exams);
+    toast('PINs generated — send each one privately (not in a group chat).', 'success');
+    render();
+  }
+
+  async function addExamQuestion(examId){
+    if(!ui.isStaff) return;
+    const ex = (DB.exams||[]).find(e=>e.id===examId);
+    if(!ex) return;
+    const typeEl = q(`#f-eq-type-${examId}`);
+    const subjEl = q(`#f-eq-subject-${examId}`);
+    const textEl = q(`#f-eq-text-${examId}`);
+    const ptsEl = q(`#f-eq-points-${examId}`);
+    const type = typeEl ? typeEl.value : 'mcq';
+    const subject = subjEl ? subjEl.value : SUBJECTS[0];
+    const text = (textEl ? textEl.value : '').trim();
+    const points = ptsEl ? (parseFloat(ptsEl.value)||1) : 1;
+    if(!text){ toast('Add the question text.', 'error'); return; }
+    let question = { id: uid('q'), subject, type, text, points };
+
+    if(type==='mcq'){
+      const optEls = [0,1,2,3].map(i=>q(`#f-eq-opt-${examId}-${i}`));
+      const correctEl = q(`input[name="f-eq-correct-${examId}"]:checked`);
+      const options = optEls.map(el=>(el ? el.value : '').trim());
+      if(options.some(o=>!o)){ toast('Fill in all 4 options.', 'error'); return; }
+      if(!correctEl){ toast('Mark which option is correct.', 'error'); return; }
+      question.options = options;
+      question.correctIndex = parseInt(correctEl.value);
+    } else if(type==='true_false'){
+      const correctEl = q(`input[name="f-eq-tf-${examId}"]:checked`);
+      if(!correctEl){ toast('Mark whether True or False is correct.', 'error'); return; }
+      question.options = ['True','False'];
+      question.correctIndex = parseInt(correctEl.value);
+    } else if(type==='short'){
+      const acceptedEl = q(`#f-eq-short-accepted-${examId}`);
+      const accepted = (acceptedEl ? acceptedEl.value : '').split('|').map(s=>s.trim()).filter(Boolean);
+      if(accepted.length===0){ toast('Enter at least one accepted answer.', 'error'); return; }
+      question.acceptedAnswers = accepted;
+    } else if(type==='numeric'){
+      const valEl = q(`#f-eq-num-value-${examId}`);
+      const tolEl = q(`#f-eq-num-tol-${examId}`);
+      const unitsEl = q(`#f-eq-num-units-${examId}`);
+      const unitReqEl = q(`#f-eq-num-unitreq-${examId}`);
+      const correctValue = valEl ? parseFloat(valEl.value) : NaN;
+      if(isNaN(correctValue)){ toast('Enter the correct numeric value.', 'error'); return; }
+      const unitRequired = unitReqEl ? !!unitReqEl.checked : true;
+      const units = (unitsEl ? unitsEl.value : '').split('|').map(s=>s.trim()).filter(Boolean);
+      if(unitRequired && units.length===0){ toast('List at least one accepted unit, or untick "unit required".', 'error'); return; }
+      question.correctValue = correctValue;
+      question.tolerance = tolEl ? (parseFloat(tolEl.value)||0) : 0;
+      question.units = units;
+      question.unitRequired = unitRequired;
+    }
+
+    ex.questions.push(question);
+    await sSet('exams', DB.exams);
+    toast('Question added.', 'success');
+    render();
+  }
+
+  async function deleteExamQuestion(examId, qid){
+    if(!ui.isStaff) return;
+    const ex = (DB.exams||[]).find(e=>e.id===examId);
+    if(!ex) return;
+    ex.questions = (ex.questions||[]).filter(qq=>qq.id!==qid);
+    await sSet('exams', DB.exams);
+    render();
+  }
+
+  async function setExamStatus(examId, status){
+    if(!ui.isStaff) return;
+    const ex = (DB.exams||[]).find(e=>e.id===examId);
+    if(!ex) return;
+    if(status==='open' && (!ex.questions || ex.questions.length===0)){ toast('Add at least one question before opening.', 'error'); return; }
+    ex.status = status;
+    await sSet('exams', DB.exams);
+    toast(`Exam ${status}.`, 'success');
+    render();
+  }
+
+  async function deleteExam(examId){
+    if(!ui.isCoach) return;
+    const ex = (DB.exams||[]).find(e=>e.id===examId);
+    if(!ex) return;
+    for(const s of DB.students){ await sDelete(`exam_attempt:${examId}:${s.name}`); }
+    DB.exams = DB.exams.filter(e=>e.id!==examId);
+    await sSet('exams', DB.exams);
+    if(ui.expandedExamId===examId) ui.expandedExamId = null;
+    if(ui.examMonitor && ui.examMonitor.examId===examId) ui.examMonitor = null;
+    if(ui.examReview && ui.examReview.examId===examId) ui.examReview = null;
+    render();
+  }
+
+  async function refreshExamResults(examId){
+    const ex = (DB.exams||[]).find(e=>e.id===examId);
+    if(!ex) return;
+    const rows = [];
+    let pendingCount = 0;
+    for(const s of DB.students){
+      const rec = await sGet(`exam_attempt:${examId}:${s.name}`);
+      let status = 'Not started', score=null, maxScore=null, pending=false;
+      if(rec){
+        if(rec.submitted){
+          status = rec.autoSubmitted ? 'Submitted (auto)' : 'Submitted';
+          score = rec.score; maxScore = rec.maxScore;
+          if(rec.pending && rec.pending.length){ pending = true; pendingCount += rec.pending.length; }
+        } else status = 'In progress';
+      }
+      rows.push({ name: s.name, status, score, maxScore, pending });
+    }
+    const submitted = rows.filter(r=>r.score!=null);
+    const avg = submitted.length>0 ? submitted.reduce((a,r)=>a+(r.maxScore>0?(r.score/r.maxScore)*100:0),0)/submitted.length : null;
+    ui.examMonitor = { examId, rows, avg, submittedCount: submitted.length, pendingCount };
+    render();
+  }
+
+  async function loadPendingReviewsIntoUi(examId){
+    const ex = (DB.exams||[]).find(e=>e.id===examId);
+    if(!ex) return;
+    const items = [];
+    for(const s of DB.students){
+      const rec = await sGet(`exam_attempt:${examId}:${s.name}`);
+      if(rec && rec.submitted && rec.pending && rec.pending.length){
+        rec.pending.forEach(p=>{
+          const qq = (ex.questions||[]).find(x=>x.id===p.qid);
+          items.push({ studentName: s.name, qid:p.qid, subject:p.subject, points:p.points, rawAnswer:p.rawAnswer, hint:p.hint, questionText: qq?qq.text:'', acceptedAnswers: qq?qq.acceptedAnswers:null });
+        });
+      }
+    }
+    ui.examReview = { examId, items };
+    render();
+  }
+
+  async function resolvePendingReview(examId, studentName, qid, decision){
+    const rec = await sGet(`exam_attempt:${examId}:${studentName}`);
+    if(!rec || !rec.pending) return;
+    const idx = rec.pending.findIndex(p=>p.qid===qid);
+    if(idx<0) return;
+    const item = rec.pending[idx];
+    rec.pending.splice(idx,1);
+    const earned = decision==='correct' ? item.points : 0;
+    rec.score = (rec.score||0) + earned;
+    if(!rec.subjectScores) rec.subjectScores = {};
+    if(!rec.subjectScores[item.subject]) rec.subjectScores[item.subject] = {earned:0, max:item.points};
+    rec.subjectScores[item.subject].earned += earned;
+    await sSet(`exam_attempt:${examId}:${studentName}`, rec);
+    toast(`Marked ${decision}.`, 'success');
+    await loadPendingReviewsIntoUi(examId);
+    await refreshExamResults(examId);
+  }
+
+  async function publishExamToAssessments(examId){
+    if(!ui.isStaff) return;
+    const ex = (DB.exams||[]).find(e=>e.id===examId);
+    if(!ex) return;
+    const subjectMax = {}; SUBJECTS.forEach(s=>{ subjectMax[s]=0; });
+    (ex.questions||[]).forEach(qq=>{ subjectMax[qq.subject] = (subjectMax[qq.subject]||0) + (qq.points||1); });
+    const scores = {};
+    let anySubmitted = false;
+    let stillPending = 0;
+    for(const s of DB.students){
+      const rec = await sGet(`exam_attempt:${examId}:${s.name}`);
+      if(rec && rec.submitted && rec.subjectScores){
+        const entry = {};
+        SUBJECTS.forEach(subj=>{
+          if(subjectMax[subj]>0) entry[subj] = Math.max(0, (rec.subjectScores[subj] && rec.subjectScores[subj].earned) || 0);
+        });
+        scores[s.name] = entry;
+        anySubmitted = true;
+        if(rec.pending && rec.pending.length) stillPending += rec.pending.length;
+      }
+    }
+    if(!anySubmitted){ toast('No submitted attempts yet — nothing to publish.', 'error'); return; }
+    DB.assessments = (DB.assessments||[]).filter(a=>a.id!==ex.publishedAssessmentId);
+    const as = { id: uid('as'), name: ex.title, maxScore: null, subjectMax, date: new Date(ex.createdAt).toISOString().slice(0,10), createdAt: Date.now(), fromExam:true, examId: ex.id, examTitle: ex.title, scores };
+    DB.assessments.push(as);
+    await sSet('assessments', DB.assessments);
+    ex.publishedAssessmentId = as.id;
+    await sSet('exams', DB.exams);
+    toast(stillPending>0 ? `Published — ${stillPending} answer(s) still need review and will update the score when resolved.` : 'Exam scores published to Assessments — they now feed into student reports.', 'success');
+    render();
+  }
+
+  /* ============================= LIVE EXAMS: TAKING ============================= */
+  let examTimerInterval = null;
+  function stopExamTimer(){
+    if(examTimerInterval){ clearInterval(examTimerInterval); examTimerInterval = null; }
+  }
+  function startExamTimer(){
+    stopExamTimer();
+    examTimerInterval = setInterval(()=>{
+      if(!ui.examAttempt){ stopExamTimer(); return; }
+      const remaining = ui.examAttempt.record.deadline - Date.now();
+      ui.examAttempt.remainingMs = Math.max(0, remaining);
+      if(remaining<=0){
+        stopExamTimer();
+        submitExamAttempt(true);
+        return;
+      }
+      const el = document.getElementById('exam-timer-display');
+      if(el) el.textContent = formatMs(ui.examAttempt.remainingMs);
+    }, 1000);
+  }
+
+  async function startOrResumeExam(){
+    const codeEl = q('#f-take-code');
+    const nameEl = q('#f-take-name');
+    const pinEl = q('#f-take-pin');
+    const code = (codeEl ? codeEl.value : '').trim().toUpperCase();
+    const name = nameEl ? nameEl.value : '';
+    const pin = (pinEl ? pinEl.value : '').trim();
+    ui.examTakeError = null;
+    if(!code || !name){ ui.examTakeError = 'Pick your name and enter the exam code.'; render(); return; }
+    const exams = await sGet('exams');
+    if(exams) DB.exams = exams;
+    const ex = (DB.exams||[]).find(e=>e.code && e.code.toUpperCase()===code);
+    if(!ex){ ui.examTakeError = 'No exam found with that code.'; render(); return; }
+    if(!ex.questions || ex.questions.length===0){ ui.examTakeError = 'This exam has no questions yet — check with your coach.'; render(); return; }
+    if(ex.studentPins && Object.prototype.hasOwnProperty.call(ex.studentPins, name)){
+      if(!pin){ ui.examTakeError = 'Enter the PIN your coach gave you.'; render(); return; }
+      if(pin !== ex.studentPins[name]){ ui.examTakeError = 'That PIN doesn\'t match this name — check with your coach.'; render(); return; }
+    }
+    let record = await sGet(`exam_attempt:${ex.id}:${name}`);
+    const now = Date.now();
+    if(record && record.submitted){
+      stopExamTimer();
+      ui.examAttempt = { exam: ex, name, record, remainingMs: 0 };
+      render();
+      return;
+    }
+    if(!record){
+      if(ex.status!=='open'){ ui.examTakeError = 'This exam is not currently open.'; render(); return; }
+      record = { examId: ex.id, name, startedAt: now, deadline: now + ex.timeLimitMinutes*60000, answers:{}, submitted:false, submittedAt:null, score:null, maxScore:null, subjectScores:null, pending:[], autoSubmitted:false };
+      await sSet(`exam_attempt:${ex.id}:${name}`, record);
+    }
+    const remainingMs = Math.max(0, record.deadline - now);
+    ui.examAttempt = { exam: ex, name, record, remainingMs };
+    render();
+    if(remainingMs<=0){ await submitExamAttempt(true); }
+    else { startExamTimer(); }
+  }
+
+  function persistExamAttempt(){
+    if(!ui.examAttempt) return;
+    const {exam, name, record} = ui.examAttempt;
+    sSet(`exam_attempt:${exam.id}:${name}`, record);
+  }
+
+  function recordExamAnswer(qid, val){
+    if(!ui.examAttempt) return;
+    if(!ui.examAttempt.record.answers) ui.examAttempt.record.answers = {};
+    ui.examAttempt.record.answers[qid] = val;
+    qa(`input[name="q-${qid}"]`).forEach(inp=>{
+      const label = inp.closest('label');
+      if(label) label.style.background = inp.checked ? 'var(--panel-2)' : 'transparent';
+    });
+    updateExamProgress();
+    persistExamAttempt();
+  }
+
+  function updateExamProgress(){
+    const progressEl = document.getElementById('exam-progress');
+    if(progressEl && ui.examAttempt){
+      const count = Object.keys(ui.examAttempt.record.answers||{}).length;
+      const total = getShuffledQuestionOrder(ui.examAttempt.exam, ui.examAttempt.name).length;
+      progressEl.textContent = `${count} of ${total} answered`;
+    }
+  }
+
+  async function submitExamAttempt(auto){
+    if(!ui.examAttempt) return;
+    stopExamTimer();
+    const {exam, name, record} = ui.examAttempt;
+    if(record.submitted) return;
+    let score=0, maxScore=0;
+    const subjectScores = {};
+    const pending = [];
+    (exam.questions||[]).forEach(qq=>{
+      const pts = qq.points||1;
+      maxScore += pts;
+      if(!subjectScores[qq.subject]) subjectScores[qq.subject] = {earned:0, max:0};
+      subjectScores[qq.subject].max += pts;
+      const raw = record.answers ? record.answers[qq.id] : undefined;
+      const result = gradeQuestionAnswer(qq, raw, exam.negativeMarking, exam.negativePenalty);
+      if(result.status==='pending'){
+        pending.push({ qid: qq.id, subject: qq.subject, points: pts, rawAnswer: raw, hint: result.hint });
+      } else {
+        score += result.earned;
+        subjectScores[qq.subject].earned += result.earned;
+      }
+    });
+    record.submitted = true;
+    record.submittedAt = Date.now();
+    record.score = score;
+    record.maxScore = maxScore;
+    record.subjectScores = subjectScores;
+    record.pending = pending;
+    record.autoSubmitted = !!auto;
+    await sSet(`exam_attempt:${exam.id}:${name}`, record);
+    ui.examAttempt = { exam, name, record };
+    toast(auto ? "Time's up — exam auto-submitted." : 'Exam submitted.', auto?'info':'success');
+    render();
+  }
+
+  function exitExamAttempt(){
+    stopExamTimer();
+    ui.examAttempt = null;
     render();
   }
 
@@ -3005,6 +3966,7 @@
     const assessments = await sGet('assessments');
     const weights = await sGet('selection_weights');
     const notes = await sGet('student_notes');
+    const exams = await sGet('exams');
     if(students){
       DB.students = students;
     } else if(legacyRoster && legacyRoster.length){
@@ -3018,6 +3980,7 @@
     DB.assessments = assessments || [];
     DB.weights = weights || {attendance:30, assessment:30, quiz:40};
     DB.notes = notes || {};
+    DB.exams = exams || [];
     if(accessPins){
       DB.pins = accessPins;
     } else if(legacyCoachPin){
