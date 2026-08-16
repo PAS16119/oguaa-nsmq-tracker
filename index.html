@@ -394,7 +394,17 @@
   }
 
   /* ============================= APP STATE ============================= */
-  let DB = { students: [], tIndex: [], pins: {coach:null, staff:null, scorer:null}, meetings: [], assessments: [], weights: {attendance:30, assessment:30, quiz:40}, notes: {}, exams: [], examTypeStats: null, examTypeStatsLoadedAt: null };
+  let DB = { students: [], tIndex: [], pins: {coach:null, staff:null, scorer:null}, meetings: [], assessments: [], weights: {attendance:30, assessment:30, quiz:40}, notes: {}, exams: [], examTypeStats: null, examTypeStatsBySubject: null, examTypeStatsLoadedAt: null, auditLog: [] };
+
+  // Appends a short, human-readable entry to the shared audit log — who did what, when.
+  // Kept intentionally lightweight (no full diffs) so it stays cheap to write and read.
+  async function logAudit(action, detail){
+    try{
+      const entry = { at: Date.now(), role: ui.role||'guest', action, detail: detail||'' };
+      DB.auditLog = [entry, ...(DB.auditLog||[])].slice(0, 300); // cap so the key doesn't grow unbounded
+      await sSet('audit_log', DB.auditLog);
+    } catch(e){ /* logging must never break the underlying action */ }
+  }
   function studentNames(){ return DB.students.map(s=>s.name); }
   let currentTournament = null;          // full loaded tournament object
   let ui = {
@@ -426,6 +436,8 @@
     examBuilderOpen:false,  // whether the "new exam" form is showing
     examMonitor:null,       // {examId, rows:[{name,status,score,maxScore}], avg, submittedCount} — staff live-results snapshot
     examReview:null,        // {examId, items:[...]} — pending short-answer/numeric responses awaiting staff decision
+    examTranscript:null,    // {examId, studentName, record} — full question-by-question answers, for coach review
+    backupBusy:null,        // 'export' | 'import' | null — disables buttons mid-operation
     examTakeError:null,     // error message on the student "enter code" screen
     examAttempt:null,       // {exam, name, record} — the student's in-progress attempt, held client-side
     examLastRevealedCount:null, // last riddle clue-count rendered, so the timer tick only re-renders when a new clue actually appears
@@ -771,6 +783,18 @@
     // and restore both so typing/tapping doesn't visually yank the page around.
     const scrollX = window.scrollX, scrollY = window.scrollY;
     const prevScrolls = Array.from(appEl.querySelectorAll(SCROLLABLE_SEL)).map(el=>el.scrollLeft);
+    // Also snapshot focus + cursor position: any input bound to re-render on every
+    // keystroke (e.g. live search/filter boxes) would otherwise lose focus after each
+    // character, forcing the person to click back in before typing the next one.
+    const active = document.activeElement;
+    let focusInfo = null;
+    if(active && appEl.contains(active) && active.id){
+      focusInfo = { id: active.id };
+      if(typeof active.selectionStart === 'number'){
+        focusInfo.selStart = active.selectionStart;
+        focusInfo.selEnd = active.selectionEnd;
+      }
+    }
     let html = renderHeader();
     html += '<main>';
     if(ui.view==='home') html += renderHome();
@@ -788,6 +812,15 @@
     window.scrollTo(scrollX, scrollY);
     const newScrolls = appEl.querySelectorAll(SCROLLABLE_SEL);
     newScrolls.forEach((el,i)=>{ if(prevScrolls[i]!=null) el.scrollLeft = prevScrolls[i]; });
+    if(focusInfo){
+      const el = document.getElementById(focusInfo.id);
+      if(el){
+        el.focus();
+        if(focusInfo.selStart!=null && typeof el.setSelectionRange==='function'){
+          try{ el.setSelectionRange(focusInfo.selStart, focusInfo.selEnd); }catch(e){}
+        }
+      }
+    }
   }
 
   function renderHeader(){
@@ -878,6 +911,25 @@
       </div>
       <p class="small-note">Saving a PIN here immediately replaces the old one — share the new PIN with whoever needs that access level.</p>
     </div>`;
+    html += renderAuditLogCard();
+    return html;
+  }
+
+  function renderAuditLogCard(){
+    const log = DB.auditLog||[];
+    let html = `<div class="card">
+      <div class="flex-between"><h2>Activity log</h2><span class="pill">${log.length} entr${log.length!==1?'ies':'y'}</span></div>
+      <p class="sub">Who deleted, published, substituted, or restored what — a running record so disputes have a paper trail. Kept to the most recent 300 actions.</p>`;
+    if(log.length===0){
+      html += `<p class="small-note">Nothing logged yet — entries appear here as deletions, substitutions, exam publishes, and restores happen.</p>`;
+    } else {
+      html += `<div style="max-height:260px; overflow-y:auto;"><table><thead><tr><th>When</th><th>Role</th><th>Action</th><th>Detail</th></tr></thead><tbody>`;
+      log.slice(0,100).forEach(e=>{
+        html += `<tr><td class="small-note">${new Date(e.at).toLocaleString()}</td><td>${escapeHtml(e.role||'')}</td><td>${escapeHtml(e.action)}</td><td class="small-note">${escapeHtml(e.detail||'')}</td></tr>`;
+      });
+      html += `</tbody></table></div>`;
+    }
+    html += `</div>`;
     return html;
   }
 
@@ -966,7 +1018,12 @@
             <button class="btn btn-sm ${ui.settingsOpen?'btn-brass':'btn-ghost'}" data-toggle-settings="1">${ui.settingsOpen?'▾ Hide':'⚙ Settings'}</button>
           </div>
           <p class="sub">This data is shared — anyone who opens this tracker sees the same tournaments and results.</p>
-          <button class="btn btn-danger btn-sm" data-reset-all="1">Reset everything</button>
+          <div class="row" style="align-items:center;">
+            <div style="flex:0;"><button class="btn btn-sm btn-brass" data-export-backup="1">${ui.backupBusy==='export'?'Preparing…':'⬇ Download backup'}</button></div>
+            <div style="flex:0;"><label class="btn btn-sm btn-ghost" style="cursor:pointer; margin:0;">⬆ Restore from backup<input type="file" id="f-import-backup" accept="application/json" style="display:none;"></label></div>
+          </div>
+          <p class="small-note" style="margin-top:6px;">The backup is a single JSON file with every student, tournament, assessment, exam, and exam answer. Keep a copy somewhere safe — download one before big changes (season resets, bulk edits) and every so often through the year.</p>
+          <button class="btn btn-danger btn-sm" style="margin-top:10px;" data-reset-all="1">Reset everything</button>
         </div>`;
       if(ui.settingsOpen) html += renderSettingsPanel();
     }
@@ -1713,6 +1770,16 @@
           <div class="stat-box"><div class="v">${winRate}%</div><div class="l">Win rate</div></div>
           <div class="stat-box"><div class="v">${p.avgRank.toFixed(1)}</div><div class="l">Avg rank</div></div>
         </div>`;
+      const recommendation = buildRecommendation(name, bd, computeAssessmentSubjectPct(name), DB.examTypeStats ? DB.examTypeStats[name] : null);
+      if(recommendation){
+        html += `<div class="small-note" style="margin-top:10px; padding:8px 10px; background:var(--panel-2); border-left:3px solid var(--brass-soft); border-radius:4px;">🎯 ${escapeHtml(recommendation)}</div>`;
+      }
+      const trend = computeAssessmentTrend(name);
+      if(trend){
+        const arrow = trend.delta>3 ? '↑' : (trend.delta<-3 ? '↓' : '→');
+        const word = trend.delta>3 ? 'improving' : (trend.delta<-3 ? 'declining' : 'holding steady');
+        html += `<div class="small-note" style="margin-top:6px;">${arrow} Assessment trend: ${word} — ${Math.round(trend.earlierAvg)}% early on vs ${Math.round(trend.laterAvg)}% recently, across ${trend.count} tests.</div>`;
+      }
       if(bd){
         html += `<button type="button" class="btn btn-sm btn-ghost" style="margin-top:10px;" data-toggle-profile="${escapeAttr(name)}">${expanded?'▾ Hide':'▸ Show'} full comprehensive report</button>`;
         if(expanded){
@@ -1744,15 +1811,33 @@
           if(typeStats){
             const typeEntries = Object.entries(typeStats).filter(([,v])=>v.total>0);
             if(typeEntries.length>0){
-              html += `<div class="small-note" style="margin:10px 0 4px;">Exam performance — by question type</div>`;
+              html += `<div class="small-note" style="margin:10px 0 4px;">Exam performance — by question type (all subjects combined)</div>`;
               typeEntries.forEach(([type,v])=>{
                 const attempted = v.correct+v.wrong;
                 const pct = attempted>0 ? Math.round(100*v.correct/attempted) : null;
                 html += `<div class="subj-row"><span>${QTYPE_LABELS[type]||type}</span><span class="mono">${pct!=null?pct+'% accuracy':'—'} (${v.correct}✓ / ${v.wrong}✗ / ${v.unanswered} unanswered)</span></div>`;
               });
             }
+            const subjMatrix = DB.examTypeStatsBySubject ? DB.examTypeStatsBySubject[name] : null;
+            if(subjMatrix){
+              const activeTypes = Object.keys(blankTypeBucket()).filter(type=>SUBJECTS.some(s=>subjMatrix[s][type].total>0));
+              const activeSubjects = SUBJECTS.filter(s=>activeTypes.some(type=>subjMatrix[s][type].total>0));
+              if(activeTypes.length>0 && activeSubjects.length>0){
+                html += `<div class="small-note" style="margin:10px 0 4px;">Exam performance — subject × question type</div>
+                  <div style="overflow-x:auto;"><table><thead><tr><th>Subject</th>${activeTypes.map(t=>`<th>${(QTYPE_LABELS[t]||t).split(' ')[0]}</th>`).join('')}</tr></thead><tbody>`;
+                activeSubjects.forEach(s=>{
+                  html += `<tr><td>${s}</td>${activeTypes.map(t=>{
+                    const v = subjMatrix[s][t];
+                    const attempted = v.correct+v.wrong;
+                    const pct = attempted>0 ? Math.round(100*v.correct/attempted) : null;
+                    return `<td class="mono">${pct!=null?pct+'%':'—'}</td>`;
+                  }).join('')}</tr>`;
+                });
+                html += `</tbody></table></div>`;
+              }
+            }
           } else {
-            html += `<p class="small-note" style="margin-top:8px;">Tap "Refresh exam-type analysis" above to break exam performance down by question type (MCQ, True/False, short answer, numeric, riddle).</p>`;
+            html += `<p class="small-note" style="margin-top:8px;">Tap "Refresh exam-type analysis" above to break exam performance down by subject and question type (MCQ, True/False, short answer, numeric, riddle).</p>`;
           }
         }
       } else if(!bd){
@@ -1804,9 +1889,15 @@
   // Fetches every exam attempt across every exam and tallies accuracy by question TYPE
   // (mcq / true_false / short / numeric / riddle) per student — the piece that can't be
   // derived from already-loaded data, since attempts live in per-student storage keys.
+  function blankTypeBucket(){ return { mcq:{correct:0,wrong:0,unanswered:0,total:0}, true_false:{correct:0,wrong:0,unanswered:0,total:0}, short:{correct:0,wrong:0,unanswered:0,total:0}, numeric:{correct:0,wrong:0,unanswered:0,total:0}, riddle:{correct:0,wrong:0,unanswered:0,total:0} }; }
+
   async function loadExamTypeStats(){
-    const stats = {};
-    studentNames().forEach(n=>{ stats[n] = { mcq:{correct:0,wrong:0,unanswered:0,total:0}, true_false:{correct:0,wrong:0,unanswered:0,total:0}, short:{correct:0,wrong:0,unanswered:0,total:0}, numeric:{correct:0,wrong:0,unanswered:0,total:0}, riddle:{correct:0,wrong:0,unanswered:0,total:0} }; });
+    const stats = {};       // stats[name][type] — overall accuracy by question type, any subject
+    const bySubject = {};   // bySubject[name][subject][type] — the full subject × type matrix
+    studentNames().forEach(n=>{
+      stats[n] = blankTypeBucket();
+      bySubject[n] = {}; SUBJECTS.forEach(s=>{ bySubject[n][s] = blankTypeBucket(); });
+    });
     for(const ex of (DB.exams||[])){
       const qById = {}; (ex.questions||[]).forEach(qq=>{ qById[qq.id]=qq; });
       for(const name of studentNames()){
@@ -1816,16 +1907,19 @@
         Object.entries(rec.perQuestionResults).forEach(([qid,res])=>{
           const qq = qById[qid];
           if(!qq || !stats[name] || !stats[name][qq.type]) return;
-          const bucket = stats[name][qq.type];
-          bucket.total++;
-          if(res.status==='correct') bucket.correct++;
-          else if(res.status==='incorrect') bucket.wrong++;
-          else if(res.status==='unanswered') bucket.unanswered++;
-          // 'pending' items not yet resolved by staff are left out of the tally
+          [stats[name][qq.type], bySubject[name][qq.subject] && bySubject[name][qq.subject][qq.type]].forEach(bucket=>{
+            if(!bucket) return;
+            bucket.total++;
+            if(res.status==='correct') bucket.correct++;
+            else if(res.status==='incorrect') bucket.wrong++;
+            else if(res.status==='unanswered') bucket.unanswered++;
+            // 'pending' items not yet resolved by staff are left out of the tally
+          });
         });
       }
     }
     DB.examTypeStats = stats;
+    DB.examTypeStatsBySubject = bySubject;
     DB.examTypeStatsLoadedAt = Date.now();
   }
 
@@ -2113,6 +2207,73 @@
     return out;
   }
 
+  // Compares a student's earlier assessment scores against their more recent ones to
+  // surface whether they're trending up or down over time — not just a flat average.
+  function computeAssessmentTrend(name){
+    const relevant = (DB.assessments||[])
+      .filter(as=>as.scores && Object.prototype.hasOwnProperty.call(as.scores, name))
+      .sort((a,b)=>a.createdAt-b.createdAt);
+    const pctFor = as=>{
+      const rec = as.scores[name];
+      if(typeof rec==='number') return as.maxScore>0 ? (rec/as.maxScore)*100 : null;
+      if(rec && typeof rec==='object'){
+        let total=0, max=0;
+        SUBJECTS.forEach(s=>{
+          const v = rec[s];
+          if(v!==undefined && v!==null && v!==''){
+            const mx = subjectMaxFor(as, s);
+            if(mx>0){ total += parseFloat(v)||0; max += mx; }
+          }
+        });
+        return max>0 ? (total/max)*100 : null;
+      }
+      return null;
+    };
+    const pcts = relevant.map(pctFor).filter(p=>p!=null);
+    if(pcts.length<4) return null; // too few data points to say anything meaningful
+    const mid = Math.floor(pcts.length/2);
+    const avg = arr=>arr.reduce((a,b)=>a+b,0)/arr.length;
+    const earlierAvg = avg(pcts.slice(0,mid));
+    const laterAvg = avg(pcts.slice(mid));
+    return { earlierAvg, laterAvg, delta: laterAvg-earlierAvg, count: pcts.length };
+  }
+
+  // Turns whatever weakness data is available (contest subject, exam subject, question
+  // type) into one concrete "practice this next" line — the piece that closes the loop
+  // from measuring performance to actually doing something about it.
+  function buildRecommendation(name, bd, asmSubj, typeStats){
+    const candidates = [];
+    if(bd){
+      SUBJECTS.forEach(s=>{
+        const v = bd.bySubject[s];
+        const attempts = v.correct+v.wrong;
+        if(attempts>=3){
+          const acc = v.correct/attempts;
+          candidates.push({ label:`${s} in contests`, acc, weight:attempts });
+        }
+      });
+    }
+    SUBJECTS.forEach(s=>{
+      const v = asmSubj[s];
+      if(v.count>=2 && v.pct!=null){
+        candidates.push({ label:`${s} in exams/assessments`, acc:v.pct/100, weight:v.count });
+      }
+    });
+    if(typeStats){
+      Object.entries(typeStats).forEach(([type,v])=>{
+        const attempts = v.correct+v.wrong;
+        if(attempts>=3){
+          candidates.push({ label:`${QTYPE_LABELS[type]||type} questions`, acc:v.correct/attempts, weight:attempts });
+        }
+      });
+    }
+    if(candidates.length===0) return null;
+    candidates.sort((a,b)=>a.acc-b.acc);
+    const weakest = candidates[0];
+    if(weakest.acc>=0.75) return null; // nothing weak enough to flag
+    return `Recommended focus for ${name}: ${weakest.label} (${Math.round(weakest.acc*100)}% accuracy across ${weakest.weight} attempt${weakest.weight!==1?'s':''}).`;
+  }
+
   function computeQuizPct(name, profiles){
     const p = profiles[name];
     if(!p || p.totalPlayed===0) return null;
@@ -2216,7 +2377,8 @@
     const w = DB.weights;
     let html = `<div class="card">
       <h2>Selection weights</h2>
-      <p class="sub">How attendance, assessments, and quiz performance combine into the aggregate score below. A student missing one category (e.g. no assessments yet) is scored on the remaining categories only.</p>`;
+      <p class="sub">How attendance, assessments, and quiz performance combine into the aggregate score below. A student missing one category (e.g. no assessments yet) is scored on the remaining categories only.</p>
+      <p class="small-note">"Assessments" pools both sources together — a manually entered offline test and a published online exam count exactly the same way here.</p>`;
     if(ui.isStaff){
       html += `<div class="row">
         <div><label class="field">Attendance</label><input type="number" min="0" id="f-weight-attendance" value="${w.attendance}"></div>
@@ -2448,7 +2610,7 @@
 
   function questionTimeLimitSec(qq){
     if(qq.type==='riddle') return (qq.clues||[]).length*5 + 5;
-    return qq.requiresCalculation ? 30 : 10;
+    return qq.requiresCalculation ? 35 : 15;
   }
 
   function renderQuestionSummary(qq){
@@ -2523,9 +2685,9 @@
     if(ui.examMonitor && ui.examMonitor.examId===ex.id){
       const mon = ui.examMonitor;
       html += `<p class="small-note" style="margin:6px 0;">${mon.submittedCount} of ${DB.students.length} submitted${mon.avg!=null?` · average ${Math.round(mon.avg)}%`:''}${mon.pendingCount?` · <strong>${mon.pendingCount} answer${mon.pendingCount!==1?'s':''} need review</strong>`:''}</p>`;
-      html += `<table><thead><tr><th>Student</th><th>Status</th><th>Score</th></tr></thead><tbody>`;
+      html += `<table><thead><tr><th>Student</th><th>Status</th><th>Score</th><th></th></tr></thead><tbody>`;
       mon.rows.slice().sort((a,b)=>a.name.localeCompare(b.name)).forEach(r=>{
-        html += `<tr><td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.status)}</td><td class="mono">${r.score!=null?r.score+'/'+r.maxScore+(r.pending?' *':''):'—'}</td></tr>`;
+        html += `<tr><td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.status)}</td><td class="mono">${r.score!=null?r.score+'/'+r.maxScore+(r.pending?' *':''):'—'}</td><td>${r.score!=null?`<button class="btn btn-sm btn-ghost" data-exam-view-transcript="${ex.id}|${escapeAttr(r.name)}">View answers</button>`:''}</td></tr>`;
       });
       html += `</tbody></table>`;
       if(mon.pendingCount>0) html += `<p class="small-note" style="margin-top:4px;">* provisional — includes unreviewed short-answer/numeric/riddle responses</p>`;
@@ -2555,7 +2717,37 @@
       });
     }
 
+    if(ui.examTranscript && ui.examTranscript.examId===ex.id){
+      html += renderExamTranscript(ex, ui.examTranscript.studentName, ui.examTranscript.record);
+    }
+
     html += `</div>`;
+    return html;
+  }
+
+  function renderExamTranscript(ex, studentName, record){
+    let html = `<div class="divider"></div>
+      <div class="flex-between"><h3 class="display" style="font-size:14px;margin:0;">${escapeHtml(studentName)}'s answers</h3>
+      <button class="btn btn-sm btn-ghost" data-exam-close-transcript="1">✕ Close</button></div>`;
+    (ex.questions||[]).forEach((qq,i)=>{
+      const res = (record.perQuestionResults||{})[qq.id];
+      if(!res){ html += `<p class="small-note" style="margin:6px 0;">Q${i+1}. ${escapeHtml(qq.text)} — not reached.</p>`; return; }
+      const statusLabel = { correct:'✓ Correct', incorrect:'✕ Incorrect', pending:'⏳ Pending review', unanswered:'— Unanswered (no penalty)' }[res.status] || res.status;
+      const statusColor = res.status==='correct' ? 'var(--brass-soft)' : (res.status==='incorrect' ? '#e06a6a' : 'var(--muted)');
+      let answerDisplay = res.rawAnswer || '(blank)';
+      if((qq.type==='mcq'||qq.type==='true_false') && res.rawAnswer!==''){
+        const idx = parseInt(res.rawAnswer);
+        answerDisplay = (qq.options && qq.options[idx]!=null) ? qq.options[idx] : res.rawAnswer;
+      }
+      html += `<div class="card" style="background:var(--panel-2); margin-bottom:8px;">
+        <p class="small-note" style="margin:0 0 4px;">Q${i+1} · ${escapeHtml(qq.subject)} · ${QTYPE_LABELS[qq.type]||qq.type}${res.timedOut?' · timed out':''}</p>
+        <p style="margin:0 0 4px; font-size:13px;">${escapeHtml(qq.type==='riddle'?`Riddle: ${(qq.clues||[])[0]||''}`:qq.text)}</p>
+        <p style="margin:0 0 4px;"><strong>Answered:</strong> ${escapeHtml(String(answerDisplay))}</p>
+        ${(qq.type==='mcq'||qq.type==='true_false') ? `<p class="small-note" style="margin:0 0 4px;">Correct option: ${escapeHtml(qq.options[qq.correctIndex]||'')}</p>` : ''}
+        ${qq.acceptedAnswers ? `<p class="small-note" style="margin:0 0 4px;">Accepted: ${qq.acceptedAnswers.map(escapeHtml).join(', ')}</p>` : ''}
+        <p style="margin:0; font-weight:600; color:${statusColor};">${statusLabel}${res.status!=='pending'?` · ${res.earned>=0?'+':''}${res.earned} pt${Math.abs(res.earned)!==1?'s':''}`:''}</p>
+      </div>`;
+    });
     return html;
   }
 
@@ -2574,7 +2766,7 @@
         <div id="eq-points-wrap-${examId}"><label class="field">Points</label><input type="number" id="f-eq-points-${examId}" min="1" value="2" style="max-width:80px;"></div>
       </div>
       <div id="eq-calc-wrap-${examId}" class="row" style="margin-top:6px; align-items:center;">
-        <div style="flex:0; display:flex; align-items:center; gap:6px;"><input type="checkbox" id="f-eq-calc-${examId}" style="width:auto;"><label for="f-eq-calc-${examId}" style="margin:0; font-size:13px;">Requires calculation (gives 30s instead of 10s)</label></div>
+        <div style="flex:0; display:flex; align-items:center; gap:6px;"><input type="checkbox" id="f-eq-calc-${examId}" style="width:auto;"><label for="f-eq-calc-${examId}" style="margin:0; font-size:13px;">Requires calculation (gives 35s instead of 15s)</label></div>
       </div>
       <div style="margin-top:8px;"><textarea id="f-eq-text-${examId}" rows="2" placeholder="Question text"></textarea></div>`;
 
@@ -2694,7 +2886,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
       }
       html += `</div>
         <input type="text" id="exam-riddle-input" placeholder="Who or what am I?">
-        <button class="btn btn-brass" style="margin-top:8px;" data-exam-answer-riddle="1">Answer now — worth ${nextCluePts} pt${nextCluePts!==1?'s':''} if correct</button>`;
+        <button class="btn btn-brass" style="margin-top:8px;" data-exam-answer-riddle="1" id="exam-riddle-answer-btn">Answer now — worth <span id="exam-riddle-pts">${nextCluePts}</span> pt${nextCluePts!==1?'s':''} if correct</button>`;
     } else {
       html += `<p style="font-weight:600; margin:4px 0 10px;">${escapeHtml(qq.text)}</p>`;
       if(qq.type==='mcq' || qq.type==='true_false'){
@@ -3033,6 +3225,14 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     if(resetAllBtn) resetAllBtn.addEventListener('click', ()=>{
       openConfirm('Reset everything?', 'This deletes every tournament, roster entry and result. This cannot be undone.', resetEverything);
     });
+    const exportBtn = q('[data-export-backup]');
+    if(exportBtn) exportBtn.addEventListener('click', exportBackup);
+    const importInput = q('#f-import-backup');
+    if(importInput) importInput.addEventListener('change', (e)=>{
+      const file = e.target.files && e.target.files[0];
+      if(!file) return;
+      openConfirm('Restore from this backup?', 'This overwrites current students, tournaments, assessments, and exams with what\'s in the file. Download a fresh backup first if you want to keep what\'s here now.', ()=>importBackupFile(file));
+    });
 
     // Squad: weights, roster, meetings, assessments
     const saveWeightsBtn = q('[data-save-weights]');
@@ -3140,6 +3340,14 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     qa('[data-exam-review]').forEach(el=>el.addEventListener('click', ()=>{
       loadPendingReviewsIntoUi(el.getAttribute('data-exam-review'));
     }));
+    qa('[data-exam-view-transcript]').forEach(el=>el.addEventListener('click', ()=>{
+      const [examId, studentName] = el.getAttribute('data-exam-view-transcript').split('|');
+      loadExamTranscript(examId, studentName);
+    }));
+    qa('[data-exam-close-transcript]').forEach(el=>el.addEventListener('click', ()=>{
+      ui.examTranscript = null;
+      render();
+    }));
     qa('[data-exam-review-decide]').forEach(el=>el.addEventListener('click', ()=>{
       const [examId, studentName, qid, decision] = el.getAttribute('data-exam-review-decide').split('|');
       resolvePendingReview(examId, studentName, qid, decision);
@@ -3158,6 +3366,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
       if(confirmBtn) confirmBtn.addEventListener('click', async ()=>{
         const fn = ui.confirmModal.onConfirm;
         ui.confirmModal = null;
+        render(); // close the modal immediately — don't wait on the (possibly slow) action below
         if(fn) await fn();
       });
     }
@@ -3506,6 +3715,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     if(!m.substitutions) m.substitutions = [];
     m.substitutions.push({ seatIndex, outCid, inCid: comp.id, atRoundKey, at: Date.now() });
     saveCurrentTournament();
+    logAudit('Substitution', `${competitorName(t,outCid)} → ${name} in ${t.name||'match'} from ${ROUND_INFO[atRoundKey].label}`);
     toast(`${name} substituted in from ${ROUND_INFO[atRoundKey].label} onward.`, 'success');
     render();
   }
@@ -3575,8 +3785,111 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     render();
   }
 
+  /* ============================= BACKUP: EXPORT / IMPORT ============================= */
+  const BACKUP_VERSION = 1;
+
+  async function exportBackup(){
+    if(!ui.isCoach || ui.backupBusy) return;
+    ui.backupBusy = 'export';
+    render();
+    try{
+      // Full tournament blobs may not all be in DB.fullCache (e.g. right after a fresh
+      // load), so re-fetch each one from its own key to guarantee a complete backup.
+      const tournaments = [];
+      for(const summary of DB.tIndex){
+        const full = await sGet('tournament:'+summary.id);
+        if(full) tournaments.push(full);
+      }
+      // Exam attempts live at their own per-student keys, not in local state — pull every
+      // one so the backup includes actual student answers, not just published summaries.
+      const examAttempts = {};
+      for(const ex of (DB.exams||[])){
+        for(const s of DB.students){
+          const rec = await sGet(`exam_attempt:${ex.id}:${s.name}`);
+          if(rec) examAttempts[`${ex.id}:${s.name}`] = rec;
+        }
+      }
+      const backup = {
+        backupVersion: BACKUP_VERSION,
+        exportedAt: new Date().toISOString(),
+        students: DB.students,
+        tournamentIndex: DB.tIndex,
+        tournaments,
+        meetings: DB.meetings,
+        assessments: DB.assessments,
+        weights: DB.weights,
+        notes: DB.notes,
+        exams: DB.exams,
+        examAttempts,
+        pins: DB.pins
+      };
+      const blob = new Blob([JSON.stringify(backup, null, 2)], {type:'application/json'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const stamp = new Date().toISOString().slice(0,10);
+      a.href = url;
+      a.download = `oguaa-nsmq-backup-${stamp}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(()=>URL.revokeObjectURL(url), 5000);
+      toast('Backup downloaded.', 'success');
+    } catch(e){
+      console.error('export failed', e);
+      toast('Backup failed — check the console for details.', 'error');
+    }
+    ui.backupBusy = null;
+    render();
+  }
+
+  async function importBackupFile(file){
+    if(!ui.isCoach || ui.backupBusy) return;
+    if(!file) return;
+    let backup;
+    try{
+      const text = await file.text();
+      backup = JSON.parse(text);
+    } catch(e){
+      toast('Could not read that file — is it a backup JSON from this app?', 'error');
+      return;
+    }
+    if(!backup || !Array.isArray(backup.students) || !Array.isArray(backup.tournamentIndex)){
+      toast('That file doesn\'t look like a valid backup.', 'error');
+      return;
+    }
+    ui.backupBusy = 'import';
+    render();
+    try{
+      await sSet('students', backup.students||[]);
+      await sSet('tournament_index', backup.tournamentIndex||[]);
+      for(const t of (backup.tournaments||[])){
+        await sSet('tournament:'+t.id, t);
+      }
+      await sSet('meetings', backup.meetings||[]);
+      await sSet('assessments', backup.assessments||[]);
+      if(backup.weights) await sSet('selection_weights', backup.weights);
+      await sSet('student_notes', backup.notes||{});
+      await sSet('exams', backup.exams||[]);
+      if(backup.pins) await sSet('access_pins', backup.pins);
+      for(const [key, rec] of Object.entries(backup.examAttempts||{})){
+        const [examId, ...rest] = key.split(':');
+        const name = rest.join(':');
+        await sSet(`exam_attempt:${examId}:${name}`, rec);
+      }
+      await logAudit('Restored backup', `${(backup.students||[]).length} students, ${(backup.tournaments||[]).length} tournaments, exported ${backup.exportedAt||'unknown date'}`);
+      toast('Backup restored — reloading…', 'success');
+      setTimeout(()=>window.location.reload(), 1200);
+    } catch(e){
+      console.error('import failed', e);
+      toast('Restore failed partway through — check the console before trying again.', 'error');
+      ui.backupBusy = null;
+      render();
+    }
+  }
+
   async function resetEverything(){
     if(!ui.isCoach){ alert('Coach mode is required.'); return; }
+    await logAudit('RESET EVERYTHING', `${DB.tIndex.length} tournaments, ${DB.students.length} students wiped`);
     for(const t of DB.tIndex){ await sDelete('tournament:'+t.id); }
     const prevStudents = DB.students.slice();
     const prevExams = (DB.exams||[]).slice();
@@ -3592,6 +3905,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     }
     DB.exams = [];
     DB.examTypeStats = null;
+    DB.examTypeStatsBySubject = null;
     DB.examTypeStatsLoadedAt = null;
     await sSet('tournament_index', []);
     await sSet('students', []);
@@ -3647,8 +3961,10 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
 
   async function deleteStudent(id){
     if(!ui.isCoach) return;
-    DB.students = DB.students.filter(s=>s.id!==id);
+    const s = DB.students.find(x=>x.id===id);
+    DB.students = DB.students.filter(x=>x.id!==id);
     sSet('students', DB.students);
+    logAudit('Deleted student', s?s.name:id);
     render();
   }
 
@@ -3681,8 +3997,10 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
 
   async function deleteMeeting(id){
     if(!ui.isCoach) return;
+    const mt = DB.meetings.find(m=>m.id===id);
     DB.meetings = DB.meetings.filter(m=>m.id!==id);
     sSet('meetings', DB.meetings);
+    logAudit('Deleted meeting', mt?mt.name:id);
     ui.expandedMeeting = null;
     render();
   }
@@ -3718,8 +4036,10 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
 
   async function deleteAssessment(id){
     if(!ui.isCoach) return;
+    const as = DB.assessments.find(a=>a.id===id);
     DB.assessments = DB.assessments.filter(a=>a.id!==id);
     sSet('assessments', DB.assessments);
+    logAudit('Deleted assessment', as?as.name:id);
     ui.expandedAssessment = null;
     render();
   }
@@ -4033,6 +4353,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     for(const s of DB.students){ await sDelete(`exam_attempt:${examId}:${s.name}`); }
     DB.exams = DB.exams.filter(e=>e.id!==examId);
     await sSet('exams', DB.exams);
+    logAudit('Deleted exam', ex.title);
     if(ui.expandedExamId===examId) ui.expandedExamId = null;
     if(ui.examMonitor && ui.examMonitor.examId===examId) ui.examMonitor = null;
     if(ui.examReview && ui.examReview.examId===examId) ui.examReview = null;
@@ -4059,6 +4380,13 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     const submitted = rows.filter(r=>r.score!=null);
     const avg = submitted.length>0 ? submitted.reduce((a,r)=>a+(r.maxScore>0?(r.score/r.maxScore)*100:0),0)/submitted.length : null;
     ui.examMonitor = { examId, rows, avg, submittedCount: submitted.length, pendingCount };
+    render();
+  }
+
+  async function loadExamTranscript(examId, studentName){
+    const record = await sGet(`exam_attempt:${examId}:${studentName}`);
+    if(!record){ toast('No attempt found for that student.', 'error'); return; }
+    ui.examTranscript = { examId, studentName, record };
     render();
   }
 
@@ -4125,12 +4453,34 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     await sSet('assessments', DB.assessments);
     ex.publishedAssessmentId = as.id;
     await sSet('exams', DB.exams);
+    logAudit('Published exam to Assessments', `${ex.title} (${Object.keys(scores).length} student${Object.keys(scores).length!==1?'s':''})`);
     toast(stillPending>0 ? `Published — ${stillPending} answer(s) still need review and will update the score when resolved.` : 'Exam scores published to Assessments — they now feed into student reports.', 'success');
     render();
   }
 
   /* ============================= LIVE EXAMS: TAKING (paced, one question at a time) ============================= */
   let examTimerInterval = null;
+  // Reveals the next riddle clue by appending it directly to the DOM, rather than doing
+  // a full render() — a full render would recreate the answer <input>, wiping out
+  // whatever the student had already started typing right as a new clue lands.
+  function revealNextRiddleClueInPlace(qq, revealedCount){
+    const clues = qq.clues||[];
+    const container = document.getElementById('exam-riddle-clues');
+    if(container){
+      const existing = container.querySelectorAll('p').length;
+      for(let c=existing; c<revealedCount; c++){
+        const p = document.createElement('p');
+        p.style.margin = '4px 0';
+        p.innerHTML = `<strong>Clue ${c+1}:</strong> ${escapeHtml(clues[c])}`;
+        container.appendChild(p);
+      }
+    }
+    const ptsEl = document.getElementById('exam-riddle-pts');
+    if(ptsEl){
+      const nextCluePts = revealedCount<=1 ? 5 : (revealedCount===2 ? 4 : 3);
+      ptsEl.textContent = nextCluePts;
+    }
+  }
   function stopExamTimer(){
     if(examTimerInterval){ clearInterval(examTimerInterval); examTimerInterval = null; }
   }
@@ -4156,7 +4506,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
         const revealedCount = Math.min((qq.clues||[]).length, Math.floor(elapsed/5000)+1);
         if(revealedCount !== ui.examLastRevealedCount){
           ui.examLastRevealedCount = revealedCount;
-          render();
+          revealNextRiddleClueInPlace(qq, revealedCount);
         }
       }
     }, 1000);
@@ -4442,6 +4792,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     const weights = await sGet('selection_weights');
     const notes = await sGet('student_notes');
     const exams = await sGet('exams');
+    const auditLog = await sGet('audit_log');
     if(students){
       DB.students = students;
     } else if(legacyRoster && legacyRoster.length){
@@ -4456,6 +4807,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     DB.weights = weights || {attendance:30, assessment:30, quiz:40};
     DB.notes = notes || {};
     DB.exams = exams || [];
+    DB.auditLog = auditLog || [];
     if(accessPins){
       DB.pins = accessPins;
     } else if(legacyCoachPin){
