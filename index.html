@@ -394,7 +394,7 @@
   }
 
   /* ============================= APP STATE ============================= */
-  let DB = { students: [], tIndex: [], pins: {coach:null, staff:null, scorer:null}, meetings: [], assessments: [], weights: {attendance:30, assessment:30, quiz:40}, notes: {}, exams: [] };
+  let DB = { students: [], tIndex: [], pins: {coach:null, staff:null, scorer:null}, meetings: [], assessments: [], weights: {attendance:30, assessment:30, quiz:40}, notes: {}, exams: [], examTypeStats: null, examTypeStatsLoadedAt: null };
   function studentNames(){ return DB.students.map(s=>s.name); }
   let currentTournament = null;          // full loaded tournament object
   let ui = {
@@ -427,7 +427,9 @@
     examMonitor:null,       // {examId, rows:[{name,status,score,maxScore}], avg, submittedCount} — staff live-results snapshot
     examReview:null,        // {examId, items:[...]} — pending short-answer/numeric responses awaiting staff decision
     examTakeError:null,     // error message on the student "enter code" screen
-    examAttempt:null        // {exam, name, record, remainingMs} — the student's in-progress attempt, held client-side
+    examAttempt:null,       // {exam, name, record} — the student's in-progress attempt, held client-side
+    examLastRevealedCount:null, // last riddle clue-count rendered, so the timer tick only re-renders when a new clue actually appears
+    examBulkOpen:{}         // {examId: true} — whether the bulk-import textarea is open for that exam
   };
 
   function syncRoleFlags(){
@@ -567,6 +569,51 @@
     trueFalse:    { label:'True/False',   count:8,  mainCorrect:2, mainPresets:[2,-1], bonusCorrect:2, bonusWrong:-1 },
     riddles:      { label:'Riddles', count:4, cluePoints:{1:5,2:4,3:3} }
   };
+  const ROUND_ORDER = ['fundamentals','speedRace','potd','trueFalse','riddles'];
+
+  // Resolves which competitor occupies a given seat for a given round, accounting for
+  // any mid-match substitutions logged on m.substitutions. A substitution takes effect
+  // from its recorded round onward — earlier rounds keep showing (and crediting) whoever
+  // actually played them, so history never gets rewritten. Falls back to the original
+  // m.slots seat when no substitutions exist, so older matches need no migration.
+  function seatCidForRound(m, seatIndex, roundKey){
+    const roundPos = ROUND_ORDER.indexOf(roundKey);
+    let cid = m.slots[seatIndex];
+    let bestPos = -1;
+    (m.substitutions||[]).forEach(s=>{
+      if(s.seatIndex!==seatIndex) return;
+      const subPos = ROUND_ORDER.indexOf(s.atRoundKey);
+      if(subPos<=roundPos && subPos>bestPos){ bestPos = subPos; cid = s.inCid; }
+    });
+    return cid;
+  }
+  function getRoundSlots(m, roundKey){
+    return m.slots.map((_,seatIndex)=>seatCidForRound(m, seatIndex, roundKey));
+  }
+  function buildAllRelevantCids(m){
+    const set = new Set(m.slots);
+    ROUND_ORDER.forEach(rk=>{ getRoundSlots(m, rk).forEach(cid=>set.add(cid)); });
+    return Array.from(set);
+  }
+  // The seat's cumulative score across the whole match, combining every competitor who
+  // ever occupied it (original plus any substitutes) — this is what bracket/standings use,
+  // since a substitution swaps personnel but the seat itself keeps competing.
+  function computeSeatTotals(m){
+    const allCids = buildAllRelevantCids(m);
+    const perCid = computeLiveTotals(m, allCids);
+    return m.slots.map((origCid, seatIndex)=>{
+      const cidsForSeat = new Set([origCid]);
+      (m.substitutions||[]).forEach(s=>{ if(s.seatIndex===seatIndex) cidsForSeat.add(s.inCid); });
+      let sum=0; cidsForSeat.forEach(cid=>{ sum += perCid[cid]||0; });
+      return sum;
+    });
+  }
+  function seatLineageLabel(t, m, seatIndex){
+    const subs = (m.substitutions||[]).filter(s=>s.seatIndex===seatIndex);
+    if(subs.length===0) return competitorName(t, m.slots[seatIndex]);
+    const chain = [m.slots[seatIndex], ...subs.map(s=>s.inCid)];
+    return chain.map(cid=>competitorName(t,cid)).join(' → ');
+  }
 
   function makeGridSlots(m, count){
     // Each slot = one subject-question-position, and EVERY contestant has their own
@@ -849,6 +896,16 @@
   }
 
   /* ============================= HOME ============================= */
+  function pickNextSession(){
+    const withLinks = (DB.meetings||[]).filter(m=>m.link);
+    if(withLinks.length===0) return null;
+    const today = new Date().toISOString().slice(0,10);
+    const upcoming = withLinks.filter(m=>m.date && m.date>=today).sort((a,b)=>a.date.localeCompare(b.date));
+    if(upcoming.length>0) return { ...upcoming[0], upcoming:true };
+    const latest = withLinks.slice().sort((a,b)=>b.createdAt-a.createdAt)[0];
+    return { ...latest, upcoming:false };
+  }
+
   function renderHome(){
     const stats = computeDashboardStats();
     let html = `<div class="flex-between" style="margin-bottom:16px;">
@@ -858,6 +915,20 @@
         </div>
         ${ui.isStaff ? `<button class="btn btn-brass" data-nav="new">+ New tournament</button>` : `<span class="pill">Viewer — ask your coach or staff lead to unlock editing</span>`}
       </div>`;
+
+    const nextSession = pickNextSession();
+    if(nextSession){
+      html += `<div class="card" style="background:var(--panel-2); border:1px solid var(--brass-soft);">
+        <div class="flex-between">
+          <div>
+            <div class="small-note" style="text-transform:uppercase; letter-spacing:1px;">${nextSession.upcoming?'Next session':'Latest session link'}</div>
+            <h3 style="margin:4px 0 0;">${escapeHtml(nextSession.name)}</h3>
+            <p class="sub" style="margin:2px 0 0;">${nextSession.date||''}</p>
+          </div>
+          <a href="${escapeAttr(nextSession.link)}" target="_blank" rel="noopener" class="btn btn-brass" style="text-decoration:none;">↗ Join</a>
+        </div>
+      </div>`;
+    }
 
     if(DB.tIndex.length>0){
       html += `<div class="card" style="background:var(--panel-2);">
@@ -1251,9 +1322,10 @@
           </select>
         </div>`;
       } else {
+        const hasSubs = (m.substitutions||[]).some(s=>s.seatIndex===slotIdx);
         html += `<div class="m-player-row">
           <span class="pill" style="min-width:56px;">${seatLabel[slotIdx]}</span>
-          <span class="name">${isGuest?'🏫 ':''}${escapeHtml(competitorName(t,cid))}${isSeed?'<span class="seed-star">★</span>':''}</span>
+          <span class="name">${isGuest?'🏫 ':''}${hasSubs?escapeHtml(seatLineageLabel(t,m,slotIdx)):escapeHtml(competitorName(t,cid))}${isSeed?'<span class="seed-star">★</span>':''}</span>
           ${m.completed ? `<span class="pill gold">${rankText}${result&&result.score!==undefined?' · '+result.score+' pts':''}</span>` : `<span class="pill">Pending</span>`}
         </div>`;
       }
@@ -1269,23 +1341,57 @@
 
   function renderLiveScorer(t, m, mi){
     initLiveScoring(m);
-    const names = {}; m.slots.forEach(cid=>names[cid]=competitorName(t,cid));
-    const totals = computeLiveTotals(m, m.slots);
+    if(!m.substitutions) m.substitutions = [];
+    const allCids = buildAllRelevantCids(m);
+    const names = {}; allCids.forEach(cid=>names[cid]=competitorName(t,cid));
+    const seatTotals = computeSeatTotals(m);
 
     let html = `<div class="live-scorer no-print">
       <div class="live-totals">`;
-    m.slots.forEach(cid=>{
-      html += `<div class="live-total-chip"><span>${escapeHtml(names[cid])}</span><span class="mono">${totals[cid]}</span></div>`;
+    m.slots.forEach((cid,seatIndex)=>{
+      html += `<div class="live-total-chip"><span>${escapeHtml(seatLineageLabel(t,m,seatIndex))}</span><span class="mono">${seatTotals[seatIndex]}</span></div>`;
     });
     html += `</div>`;
 
-    html += renderMainBonusRound(m, mi, 'fundamentals', names, m.slots);
-    html += renderSpeedRaceRound(m, mi, names, m.slots);
-    html += renderPotdRound(m, mi, names, m.slots);
-    html += renderMainBonusRound(m, mi, 'trueFalse', names, m.slots);
-    html += renderRiddlesRound(m, mi, names, m.slots);
+    html += renderSubstitutionPanel(t, m, mi);
+
+    html += renderMainBonusRound(m, mi, 'fundamentals', names, getRoundSlots(m,'fundamentals'));
+    html += renderSpeedRaceRound(m, mi, names, getRoundSlots(m,'speedRace'));
+    html += renderPotdRound(m, mi, names, getRoundSlots(m,'potd'));
+    html += renderMainBonusRound(m, mi, 'trueFalse', names, getRoundSlots(m,'trueFalse'));
+    html += renderRiddlesRound(m, mi, names, getRoundSlots(m,'riddles'));
 
     html += `<div style="margin-top:14px;"><button class="btn btn-brass" data-finish-live-match="${mi}">✓ Finish match &amp; save score</button></div>`;
+    html += `</div>`;
+    return html;
+  }
+
+  function renderSubstitutionPanel(t, m, mi){
+    const availStudents = DB.students.filter(s=>!t.competitors.some(c=>c.name===s.name));
+    let html = `<div class="card" style="background:var(--panel-2); margin-bottom:14px;">
+      <div class="flex-between"><h3 style="margin:0; font-size:14px;">Substitute a seat</h3></div>
+      <p class="small-note" style="margin:6px 0 10px;">Swap in anyone from the full roster — not just those originally selected — from a chosen round onward. Earlier rounds keep their recorded scores under whoever actually played them.</p>
+      <div class="row">
+        <div><label class="field">Seat</label><select id="f-sub-seat-${mi}">
+          ${m.slots.map((cid,i)=>`<option value="${i}">${escapeHtml(seatLineageLabel(t,m,i))}</option>`).join('')}
+        </select></div>
+        <div><label class="field">Bring in</label><select id="f-sub-in-${mi}">
+          <option value="">Select a student…</option>
+          ${availStudents.map(s=>`<option value="${escapeAttr(s.name)}">${escapeHtml(s.name)}${s.class?' — '+escapeHtml(s.class):''}</option>`).join('')}
+        </select></div>
+        <div><label class="field">From round</label><select id="f-sub-round-${mi}">
+          ${ROUND_ORDER.map(rk=>`<option value="${rk}">${ROUND_INFO[rk].label}</option>`).join('')}
+        </select></div>
+        <div style="flex:0;"><button class="btn btn-sm btn-brass" data-substitute-seat="${mi}">Substitute</button></div>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <div><input type="text" id="f-sub-guest-${mi}" placeholder="Or bring in a guest school…"></div>
+        <div style="flex:0;"><button class="btn btn-sm" data-substitute-seat-guest="${mi}">Substitute guest</button></div>
+      </div>`;
+    const subs = m.substitutions||[];
+    if(subs.length>0){
+      html += `<div class="small-note" style="margin-top:8px;">Substitution history: ${subs.map(s=>`${escapeHtml(competitorName(t,s.outCid))} → ${escapeHtml(competitorName(t,s.inCid))} (from ${ROUND_INFO[s.atRoundKey].label})`).join(' · ')}</div>`;
+    }
     html += `</div>`;
     return html;
   }
@@ -1560,10 +1666,14 @@
   /* ============================= PROFILES ============================= */
   function renderProfiles(){
     let html = `<h2 class="display" style="font-size:22px;">Student profiles</h2>
-      <p class="sub">Performance across every tournament this student has played in.</p>
-      <div class="row" style="margin-bottom:14px;">
+      <p class="sub">Performance across every tournament, exam, and assessment this student has been part of.</p>
+      <div class="row" style="margin-bottom:14px; align-items:center;">
         <div><input type="text" id="f-profile-filter" placeholder="Search a name…" value="${escapeAttr(ui.profileFilter)}"></div>
+        <div style="flex:0;"><button class="btn btn-sm btn-ghost" data-refresh-exam-stats="1">↻ Refresh exam-type analysis</button></div>
       </div>`;
+    if(DB.examTypeStatsLoadedAt){
+      html += `<p class="small-note" style="margin:-8px 0 14px;">Exam-type analysis last refreshed ${new Date(DB.examTypeStatsLoadedAt).toLocaleTimeString()}.</p>`;
+    }
 
     const profiles = buildAllProfiles();
     const breakdown = buildContestBreakdown();
@@ -1604,38 +1714,68 @@
           <div class="stat-box"><div class="v">${p.avgRank.toFixed(1)}</div><div class="l">Avg rank</div></div>
         </div>`;
       if(bd){
-        html += `<button type="button" class="btn btn-sm btn-ghost" style="margin-top:10px;" data-toggle-profile="${escapeAttr(name)}">${expanded?'▾ Hide':'▸ Show'} contest analysis (subject &amp; round breakdown)</button>`;
+        html += `<button type="button" class="btn btn-sm btn-ghost" style="margin-top:10px;" data-toggle-profile="${escapeAttr(name)}">${expanded?'▾ Hide':'▸ Show'} full comprehensive report</button>`;
         if(expanded){
-          html += `<div class="divider"></div><div class="small-note" style="margin-bottom:4px;">By subject</div>`;
+          html += `<div class="divider"></div><div class="small-note" style="margin-bottom:4px;">Contest performance — by subject</div>`;
           SUBJECTS.forEach(s=>{
             const v = bd.bySubject[s];
             html += `<div class="subj-row"><span>${s}</span><span class="mono">${v.pts>0?'+':''}${v.pts.toFixed(1).replace(/\.0$/,'')} pts (${v.correct}✓ / ${v.wrong}✗)</span></div>`;
           });
-          html += `<div class="small-note" style="margin:10px 0 4px;">By round</div>`;
+          html += `<div class="small-note" style="margin:10px 0 4px;">Contest performance — by round</div>`;
           const r = bd.byRound;
           html += `<div class="subj-row"><span>Fundamentals</span><span class="mono">${r.fundamentals.pts.toFixed(1).replace(/\.0$/,'')} pts (${r.fundamentals.correct}✓ / ${r.fundamentals.wrong}✗)</span></div>`;
           html += `<div class="subj-row"><span>Speed Race</span><span class="mono">${r.speedRace.pts.toFixed(1).replace(/\.0$/,'')} pts (${r.speedRace.correct}✓ / ${r.speedRace.wrong}✗)</span></div>`;
           html += `<div class="subj-row"><span>Problem of the Day</span><span class="mono">${r.potd.pts.toFixed(1).replace(/\.0$/,'')} pts (${r.potd.count} attempt${r.potd.count!==1?'s':''})</span></div>`;
           html += `<div class="subj-row"><span>True/False</span><span class="mono">${r.trueFalse.pts.toFixed(1).replace(/\.0$/,'')} pts (${r.trueFalse.correct}✓ / ${r.trueFalse.wrong}✗)</span></div>`;
           html += `<div class="subj-row"><span>Riddles</span><span class="mono">${r.riddles.pts.toFixed(1).replace(/\.0$/,'')} pts (${r.riddles.solved} solved)</span></div>`;
-        }
-      }
 
-      const asmSubj = computeAssessmentSubjectPct(name);
-      const asmSubjEntries = SUBJECTS.map(s=>asmSubj[s]).filter(v=>v.pct!=null);
-      if(asmSubjEntries.length>0){
-        html += `<div class="divider"></div><div class="small-note" style="margin-bottom:4px;">Exam average by subject</div>`;
-        SUBJECTS.forEach(s=>{
-          const v = asmSubj[s];
-          if(v.pct==null) return;
-          html += `<div class="subj-row"><span>${s}</span><span class="mono">${Math.round(v.pct)}% (${v.count} test${v.count!==1?'s':''})</span></div>`;
-        });
+          const asmSubj = computeAssessmentSubjectPct(name);
+          const asmSubjEntries = SUBJECTS.map(s=>asmSubj[s]).filter(v=>v.pct!=null);
+          if(asmSubjEntries.length>0){
+            html += `<div class="small-note" style="margin:10px 0 4px;">Exam performance — by subject</div>`;
+            SUBJECTS.forEach(s=>{
+              const v = asmSubj[s];
+              if(v.pct==null) return;
+              html += `<div class="subj-row"><span>${s}</span><span class="mono">${Math.round(v.pct)}% (${v.count} test${v.count!==1?'s':''})</span></div>`;
+            });
+          }
+
+          const typeStats = DB.examTypeStats ? DB.examTypeStats[name] : null;
+          if(typeStats){
+            const typeEntries = Object.entries(typeStats).filter(([,v])=>v.total>0);
+            if(typeEntries.length>0){
+              html += `<div class="small-note" style="margin:10px 0 4px;">Exam performance — by question type</div>`;
+              typeEntries.forEach(([type,v])=>{
+                const attempted = v.correct+v.wrong;
+                const pct = attempted>0 ? Math.round(100*v.correct/attempted) : null;
+                html += `<div class="subj-row"><span>${QTYPE_LABELS[type]||type}</span><span class="mono">${pct!=null?pct+'% accuracy':'—'} (${v.correct}✓ / ${v.wrong}✗ / ${v.unanswered} unanswered)</span></div>`;
+              });
+            }
+          } else {
+            html += `<p class="small-note" style="margin-top:8px;">Tap "Refresh exam-type analysis" above to break exam performance down by question type (MCQ, True/False, short answer, numeric, riddle).</p>`;
+          }
+        }
+      } else if(!bd){
+        // no contest data — still show exam-only breakdown when it exists
+        const asmSubj = computeAssessmentSubjectPct(name);
+        const asmSubjEntries = SUBJECTS.map(s=>asmSubj[s]).filter(v=>v.pct!=null);
+        if(asmSubjEntries.length>0){
+          html += `<button type="button" class="btn btn-sm btn-ghost" style="margin-top:10px;" data-toggle-profile="${escapeAttr(name)}">${expanded?'▾ Hide':'▸ Show'} exam analysis</button>`;
+          if(expanded){
+            html += `<div class="divider"></div><div class="small-note" style="margin-bottom:4px;">Exam performance — by subject</div>`;
+            SUBJECTS.forEach(s=>{
+              const v = asmSubj[s];
+              if(v.pct==null) return;
+              html += `<div class="subj-row"><span>${s}</span><span class="mono">${Math.round(v.pct)}% (${v.count} test${v.count!==1?'s':''})</span></div>`;
+            });
+          }
+        }
       }
 
       const narrative = buildStudentNarrative(name, p, bd, att, asm);
       if(narrative){
         html += `<div class="divider"></div>
-          <div class="small-note" style="margin-bottom:4px;">Coach's read</div>
+          <div class="small-note" style="margin-bottom:4px;">Coach's read — strengths &amp; weaknesses</div>
           <p style="font-size:13px; color:var(--text); line-height:1.5; margin:0;">${escapeHtml(narrative)}</p>`;
       }
 
@@ -1659,6 +1799,34 @@
       html += `</div>`;
     });
     return html;
+  }
+
+  // Fetches every exam attempt across every exam and tallies accuracy by question TYPE
+  // (mcq / true_false / short / numeric / riddle) per student — the piece that can't be
+  // derived from already-loaded data, since attempts live in per-student storage keys.
+  async function loadExamTypeStats(){
+    const stats = {};
+    studentNames().forEach(n=>{ stats[n] = { mcq:{correct:0,wrong:0,unanswered:0,total:0}, true_false:{correct:0,wrong:0,unanswered:0,total:0}, short:{correct:0,wrong:0,unanswered:0,total:0}, numeric:{correct:0,wrong:0,unanswered:0,total:0}, riddle:{correct:0,wrong:0,unanswered:0,total:0} }; });
+    for(const ex of (DB.exams||[])){
+      const qById = {}; (ex.questions||[]).forEach(qq=>{ qById[qq.id]=qq; });
+      for(const name of studentNames()){
+        let rec;
+        try{ rec = await sGet(`exam_attempt:${ex.id}:${name}`); } catch(e){ rec = null; }
+        if(!rec || !rec.submitted || !rec.perQuestionResults) continue;
+        Object.entries(rec.perQuestionResults).forEach(([qid,res])=>{
+          const qq = qById[qid];
+          if(!qq || !stats[name] || !stats[name][qq.type]) return;
+          const bucket = stats[name][qq.type];
+          bucket.total++;
+          if(res.status==='correct') bucket.correct++;
+          else if(res.status==='incorrect') bucket.wrong++;
+          else if(res.status==='unanswered') bucket.unanswered++;
+          // 'pending' items not yet resolved by staff are left out of the tally
+        });
+      }
+    }
+    DB.examTypeStats = stats;
+    DB.examTypeStatsLoadedAt = Date.now();
   }
 
   function computeDashboardStats(){
@@ -1764,6 +1932,20 @@
         parts.push(`In exams, ${entries[0].s} is the strongest subject (${Math.round(entries[0].pct)}%) and ${entries[entries.length-1].s} the weakest (${Math.round(entries[entries.length-1].pct)}%).`);
       }
     }
+    const typeStats = DB.examTypeStats ? DB.examTypeStats[name] : null;
+    if(typeStats){
+      const typeEntries = Object.entries(typeStats).map(([type,v])=>{
+        const attempted = v.correct+v.wrong;
+        return { type, pct: attempted>0 ? 100*v.correct/attempted : null, attempted };
+      }).filter(x=>x.pct!=null && x.attempted>=2);
+      if(typeEntries.length>1){
+        typeEntries.sort((a,b)=>b.pct-a.pct);
+        const best = typeEntries[0], worst = typeEntries[typeEntries.length-1];
+        if(best.type!==worst.type){
+          parts.push(`By question style, ${name} handles ${QTYPE_LABELS[best.type]||best.type} questions best (${Math.round(best.pct)}% accuracy) but struggles more with ${QTYPE_LABELS[worst.type]||worst.type} (${Math.round(worst.pct)}%) — worth factoring into how questions are picked in training.`);
+        }
+      }
+    }
     return parts.join(' ');
   }
 
@@ -1801,6 +1983,11 @@
           m.slots.forEach(cid=>{
             const comp = (t.competitors||[]).find(c=>c.id===cid);
             if(comp && comp.type!=='guest') cidNames[cid] = comp.memberNames && comp.memberNames.length ? comp.memberNames : [comp.name];
+          });
+          (m.substitutions||[]).forEach(s=>{
+            if(cidNames[s.inCid]) return;
+            const comp = (t.competitors||[]).find(c=>c.id===s.inCid);
+            if(comp && comp.type!=='guest') cidNames[s.inCid] = comp.memberNames && comp.memberNames.length ? comp.memberNames : [comp.name];
           });
           function credit(cid, subject, pts, isCorrect, roundKey){
             const names = cidNames[cid]; if(!names) return;
@@ -2104,8 +2291,11 @@
       const totalCount = Object.keys(mt.attendance||{}).length;
       const expanded = ui.expandedMeeting === mt.id;
       html += `<div class="t-list-item" data-toggle-meeting="${mt.id}">
-        <div><h3>${escapeHtml(mt.name)}</h3><p>${mt.date?mt.date+' · ':''}${presentCount}/${totalCount} present${mt.link?' · online link attached':''}</p></div>
-        <span class="pill">${expanded?'▾':'▸'}</span>
+        <div><h3>${escapeHtml(mt.name)}</h3><p>${mt.date?mt.date+' · ':''}${presentCount}/${totalCount} present</p></div>
+        <div style="display:flex; align-items:center; gap:8px;">
+          ${mt.link?`<a href="${escapeAttr(mt.link)}" target="_blank" rel="noopener" class="btn btn-sm btn-brass" style="text-decoration:none;" data-stop-row-toggle="1">↗ Join</a>`:''}
+          <span class="pill">${expanded?'▾':'▸'}</span>
+        </div>
       </div>`;
       if(expanded){
         html += `<div class="card" style="background:var(--panel-2); margin-top:-4px; margin-bottom:14px;">`;
@@ -2194,7 +2384,7 @@
   function renderExams(){
     if(ui.examAttempt) return renderExamTaking();
     let html = `<h2 class="display" style="font-size:22px;">Exams</h2>
-      <p class="sub">Timed, auto-marked tests — multiple-choice, true/false, short answer, and numeric-with-units. Students answer from any device; scores publish straight into Squad reports.</p>`;
+      <p class="sub">Timed, auto-marked tests — multiple-choice, true/false, short answer, numeric-with-units, and clue-by-clue riddles. Each question is answered one at a time against its own clock. Scores publish straight into Squad reports.</p>`;
     html += renderTakeExamCard();
     if(ui.isStaff) html += renderExamManagement();
     else html += `<div class="card"><p class="small-note">Exam creation and results are managed by staff. Got a code and PIN from your coach? Enter them above to start.</p></div>`;
@@ -2204,7 +2394,7 @@
   function renderTakeExamCard(){
     let html = `<div class="card">
       <h2>Take an exam</h2>
-      <p class="sub">Enter the code and the personal PIN your coach gave you, then pick your name. Reopening this page with the same name and PIN resumes an exam already in progress; the clock keeps running either way.</p>`;
+      <p class="sub">Enter the code and the personal PIN your coach gave you, then pick your name. Reopening this page with the same name and PIN resumes exactly where you left off — the clock doesn't pause while you're away.</p>`;
     if(ui.examTakeError) html += `<div class="warn-box">${escapeHtml(ui.examTakeError)}</div>`;
     html += `<div class="row">
         <div><label class="field">Exam code</label><input type="text" id="f-take-code" placeholder="e.g. QX7K2" style="text-transform:uppercase;"></div>
@@ -2228,14 +2418,20 @@
     if(ui.examBuilderOpen){
       html += `<div class="row" style="margin-top:10px;">
         <div><input type="text" id="f-exam-title" placeholder="Exam title (e.g. Biology Take-Home Test 1)"></div>
-        <div><label class="field">Time limit (minutes)</label><input type="number" id="f-exam-minutes" min="1" value="30"></div>
       </div>
+      <p class="small-note" style="margin-top:6px;">Timing is set per question, not for the whole exam — see below.</p>
       <div class="row" style="margin-top:8px; align-items:center;">
-        <div style="flex:0; display:flex; align-items:center; gap:6px;"><input type="checkbox" id="f-exam-negmark" checked style="width:auto;"><label for="f-exam-negmark" style="margin:0; font-size:13px;">Penalize wrong MCQ / True-or-False answers</label></div>
-        <div style="max-width:100px;"><input type="number" id="f-exam-negpenalty" value="1" min="0" step="0.5" title="Points deducted per wrong MCQ/True-False answer"></div>
+        <div style="flex:0; display:flex; align-items:center; gap:6px;"><input type="checkbox" id="f-exam-negmark" checked style="width:auto;"><label for="f-exam-negmark" style="margin:0; font-size:13px;">MCQ / True-False: penalize wrong answers</label></div>
+        <div style="max-width:90px;"><input type="number" id="f-exam-negpenalty" value="1" min="0" step="0.5" title="Points deducted per wrong MCQ/True-False answer"></div>
+      </div>
+      <div class="row" style="margin-top:6px; align-items:center;">
+        <div style="flex:0; display:flex; align-items:center; gap:6px;"><input type="checkbox" id="f-exam-shortneg" checked style="width:auto;"><label for="f-exam-shortneg" style="margin:0; font-size:13px;">Short answer / numeric / riddle: penalize wrong answers</label></div>
+        <div style="max-width:90px;"><input type="number" id="f-exam-shortpenalty" value="1" min="0" step="0.5" title="Points deducted per wrong short-answer/numeric/riddle answer"></div>
+      </div>
+      <div class="row" style="margin-top:6px; align-items:center;">
         <div style="flex:0; display:flex; align-items:center; gap:6px;"><input type="checkbox" id="f-exam-shuffle" checked style="width:auto;"><label for="f-exam-shuffle" style="margin:0; font-size:13px;">Shuffle question &amp; option order per student</label></div>
       </div>
-      <p class="small-note" style="margin-top:6px;">Short-answer and numeric questions are never penalized for a wrong answer, whatever this is set to.</p>
+      <p class="small-note" style="margin-top:6px;">Running out the clock loses the marks for that question but does not trigger the wrong-answer penalty — only an answer that's actually submitted and wrong does.</p>
       <div class="row" style="margin-top:8px;"><div style="flex:0;"><button class="btn btn-brass" data-create-exam="1">Create</button></div></div>`;
     }
     html += `</div>`;
@@ -2248,7 +2444,12 @@
     return html;
   }
 
-  const QTYPE_LABELS = { mcq:'Multiple choice', true_false:'True / False', short:'Short answer', numeric:'Numeric (with units)' };
+  const QTYPE_LABELS = { mcq:'Multiple choice', true_false:'True / False', short:'Short answer', numeric:'Numeric (with units)', riddle:'Riddle (clue-by-clue)' };
+
+  function questionTimeLimitSec(qq){
+    if(qq.type==='riddle') return (qq.clues||[]).length*5 + 5;
+    return qq.requiresCalculation ? 30 : 10;
+  }
 
   function renderQuestionSummary(qq){
     let detail = '';
@@ -2259,9 +2460,12 @@
     } else if(qq.type==='numeric'){
       const units = (qq.units||[]).join(' / ');
       detail = `Answer: ${qq.correctValue}${qq.tolerance?` (±${qq.tolerance})`:''}${qq.unitRequired && units ? ' '+escapeHtml(units) : (qq.unitRequired?' — unit required':' — unit optional')}`;
+    } else if(qq.type==='riddle'){
+      detail = `${(qq.clues||[]).length} clue${(qq.clues||[]).length!==1?'s':''} · answer: ${(qq.acceptedAnswers||[]).map(escapeHtml).join(', ')} · 5/4/3 pts by clue reached`;
     }
-    return `<span class="pill">${escapeHtml(qq.subject)}</span> <span class="pill" style="opacity:.75;">${QTYPE_LABELS[qq.type]||qq.type}</span> <span style="font-size:13px;">${escapeHtml(qq.text)}</span>
-      <div class="small-note" style="margin-top:2px;">${detail} · ${qq.points||1} pt${(qq.points||1)!==1?'s':''}${(qq.type==='mcq'||qq.type==='true_false')?'':' · no penalty if wrong'}</div>`;
+    const timing = qq.type==='riddle' ? `${questionTimeLimitSec(qq)}s total` : `${questionTimeLimitSec(qq)}s${qq.requiresCalculation?' (calculation)':''}`;
+    return `<span class="pill">${escapeHtml(qq.subject)}</span> <span class="pill" style="opacity:.75;">${QTYPE_LABELS[qq.type]||qq.type}</span> <span class="pill" style="opacity:.75;">${timing}</span> <span style="font-size:13px;">${escapeHtml(qq.text)}</span>
+      <div class="small-note" style="margin-top:2px;">${detail}${qq.type!=='riddle'?` · ${qq.points||1} pt${(qq.points||1)!==1?'s':''}`:''}</div>`;
   }
 
   function renderExamListItem(ex){
@@ -2269,7 +2473,7 @@
     const qCount = (ex.questions||[]).length;
     const badgeCls = ex.status==='open' ? 'status-live' : (ex.status==='closed' ? 'status-done' : '');
     let html = `<div class="t-list-item" data-toggle-exam="${ex.id}">
-      <div><h3>${escapeHtml(ex.title)}</h3><p>${qCount} question${qCount!==1?'s':''} · ${ex.timeLimitMinutes} min${ex.publishedAssessmentId?' · published to reports':''}</p></div>
+      <div><h3>${escapeHtml(ex.title)}</h3><p>${qCount} question${qCount!==1?'s':''}${ex.publishedAssessmentId?' · published to reports':''}</p></div>
       <div style="display:flex; align-items:center; gap:8px;">
         <span class="status-badge ${badgeCls}">${ex.status}</span>
         <span class="pill">${expanded?'▾':'▸'}</span>
@@ -2324,7 +2528,7 @@
         html += `<tr><td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.status)}</td><td class="mono">${r.score!=null?r.score+'/'+r.maxScore+(r.pending?' *':''):'—'}</td></tr>`;
       });
       html += `</tbody></table>`;
-      if(mon.pendingCount>0) html += `<p class="small-note" style="margin-top:4px;">* provisional — includes unreviewed short-answer/numeric responses</p>`;
+      if(mon.pendingCount>0) html += `<p class="small-note" style="margin-top:4px;">* provisional — includes unreviewed short-answer/numeric/riddle responses</p>`;
       html += `<div class="row" style="margin-top:10px;">
         <div style="flex:0;"><button class="btn btn-sm ${mon.pendingCount?'btn-brass':''}" data-exam-review="${ex.id}">Review ${mon.pendingCount?`(${mon.pendingCount})`:'answers'}</button></div>
         <div style="flex:0;"><button class="btn btn-sm btn-brass" data-exam-publish="${ex.id}">${ex.publishedAssessmentId?'Republish':'Publish'} scores to Assessments</button></div>
@@ -2336,11 +2540,11 @@
     if(ui.examReview && ui.examReview.examId===ex.id){
       html += `<div class="divider"></div><h3 class="display" style="font-size:14px;margin:0 0 8px;">Needs review</h3>`;
       if(ui.examReview.items.length===0){
-        html += `<p class="small-note">Nothing pending — every short-answer and numeric response has been matched automatically.</p>`;
+        html += `<p class="small-note">Nothing pending — every short-answer, numeric, and riddle response has been matched automatically.</p>`;
       }
       ui.examReview.items.forEach(it=>{
         html += `<div class="card" style="background:var(--panel); margin-bottom:8px;">
-          <p class="small-note" style="margin:0 0 4px;">${escapeHtml(it.studentName)} · ${escapeHtml(it.subject)} · ${it.points} pt${it.points!==1?'s':''}</p>
+          <p class="small-note" style="margin:0 0 4px;">${escapeHtml(it.studentName)} · ${escapeHtml(it.subject)} · up to ${it.points} pt${it.points!==1?'s':''}</p>
           <p style="margin:0 0 4px; font-size:13px;">${escapeHtml(it.questionText)}</p>
           <p style="margin:0 0 4px;"><strong>Answered:</strong> ${escapeHtml(String(it.rawAnswer||'(blank)'))}</p>
           ${it.acceptedAnswers ? `<p class="small-note" style="margin:0 0 4px;">Accepted: ${it.acceptedAnswers.map(escapeHtml).join(', ')}</p>` : ''}
@@ -2364,9 +2568,13 @@
           <option value="true_false">True / False</option>
           <option value="short">Short answer (one/few words)</option>
           <option value="numeric">Numeric — with units</option>
+          <option value="riddle">Riddle — clues revealed one at a time</option>
         </select></div>
         <div><label class="field">Subject</label><select id="f-eq-subject-${examId}">${SUBJECTS.map(s=>`<option value="${escapeAttr(s)}">${escapeHtml(s)}</option>`).join('')}</select></div>
-        <div><label class="field">Points</label><input type="number" id="f-eq-points-${examId}" min="1" value="1" style="max-width:80px;"></div>
+        <div id="eq-points-wrap-${examId}"><label class="field">Points</label><input type="number" id="f-eq-points-${examId}" min="1" value="2" style="max-width:80px;"></div>
+      </div>
+      <div id="eq-calc-wrap-${examId}" class="row" style="margin-top:6px; align-items:center;">
+        <div style="flex:0; display:flex; align-items:center; gap:6px;"><input type="checkbox" id="f-eq-calc-${examId}" style="width:auto;"><label for="f-eq-calc-${examId}" style="margin:0; font-size:13px;">Requires calculation (gives 30s instead of 10s)</label></div>
       </div>
       <div style="margin-top:8px;"><textarea id="f-eq-text-${examId}" rows="2" placeholder="Question text"></textarea></div>`;
 
@@ -2391,7 +2599,7 @@
     // Short answer group
     html += `<div id="eq-group-short-${examId}" style="display:none;">
       <div style="margin-top:6px;"><input type="text" id="f-eq-short-accepted-${examId}" placeholder="Accepted answers, separated by | (e.g. mitochondria | mitochondrion)"></div>
-      <p class="small-note" style="margin-top:4px;">Marking is case/spacing-insensitive. Close-but-not-exact answers are queued for you to approve rather than auto-failed.</p>
+      <p class="small-note" style="margin-top:4px;">Marking is case/spacing-insensitive. Close-but-not-exact answers are queued for you to approve instead of auto-failed.</p>
     </div>`;
 
     // Numeric group
@@ -2406,7 +2614,33 @@
       </div>
     </div>`;
 
-    html += `<button class="btn btn-sm" style="margin-top:10px;" data-exam-add-question="${examId}">Add question</button>`;
+    // Riddle group
+    html += `<div id="eq-group-riddle-${examId}" style="display:none;">
+      <p class="small-note" style="margin:6px 0 4px;">One clue per line. Clue 1 shows immediately; each next clue appears 5 seconds later. Answering on clue 1 scores 5 pts, clue 2 scores 4, clue 3 or later scores 3.</p>
+      <textarea id="f-eq-riddle-clues-${examId}" rows="4" placeholder="I am a unicellular free-living organism.&#10;I belong to the phylum Rhizopoda.&#10;I move using pseudopodia."></textarea>
+      <div style="margin-top:6px;"><input type="text" id="f-eq-riddle-accepted-${examId}" placeholder="Accepted answers, separated by | (e.g. amoeba | ameba)"></div>
+    </div>`;
+
+    html += `<button class="btn btn-sm" style="margin-top:10px;" data-exam-add-question="${examId}">Add question</button>
+      <button class="btn btn-sm btn-ghost" style="margin-top:10px; margin-left:6px;" data-toggle-exam-bulk="${examId}">${ui.examBulkOpen[examId]?'▾ Hide bulk-add':'⇪ Bulk-add (paste many)'}</button>`;
+
+    if(ui.examBulkOpen[examId]){
+      html += `<div class="card" style="background:var(--panel); margin-top:10px;">
+        <p class="small-note" style="margin:0 0 6px;">One question per line, fields separated by <code>||</code>. Use <code>;</code> to separate lists within a field (accepted answers, units, clues). Blank lines and lines starting with # are ignored.</p>
+        <pre style="font-size:11px; white-space:pre-wrap; background:var(--panel-2); padding:8px; border-radius:6px; margin:0 0 8px;"># MCQ||Subject||Question||OptA||OptB||OptC||OptD||CorrectLetter(A-D)||Points||Calc(Y/N)
+MCQ||Biology||Powerhouse of the cell?||Nucleus||Mitochondria||Ribosome||Golgi||B||2||N
+# TF||Subject||Statement||True/False||Points||Calc(Y/N)
+TF||Physics||Light travels faster than sound||True||2||N
+# SHORT||Subject||Question||accepted;answers||Points||Calc(Y/N)
+SHORT||Biology||Organelle that does photosynthesis?||chloroplast;chloroplasts||3||N
+# NUMERIC||Subject||Question||value||tolerance||units;alt||UnitRequired(Y/N)||Points||Calc(Y/N)
+NUMERIC||Mathematics||Area of a 2m×2.5m rectangle?||5||0||m^2;m2;sqm||Y||3||Y
+# RIDDLE||Subject||clue1;clue2;clue3||accepted;answers
+RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.;I move using pseudopodia.||amoeba;ameba</pre>
+        <textarea id="f-eq-bulk-${examId}" rows="6" placeholder="Paste your lines here…"></textarea>
+        <button class="btn btn-sm btn-brass" style="margin-top:8px;" data-exam-add-bulk="${examId}">Add all valid lines</button>
+      </div>`;
+    }
     return html;
   }
 
@@ -2417,57 +2651,72 @@
       return `<div class="card" style="text-align:center;">
         <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;">${escapeHtml(exam.title)}</div>
         <div class="display" style="font-size:28px;color:var(--brass-soft);margin:8px 0;">${record.score} / ${record.maxScore}${provisional?' *':''}</div>
-        <p class="sub">${escapeHtml(name)}${record.autoSubmitted?' · time expired, auto-submitted':' · submitted'}</p>
+        <p class="sub">${escapeHtml(name)}${record.timedOutCount?` · ${record.timedOutCount} question${record.timedOutCount!==1?'s':''} timed out (no penalty, just no marks)`:' · submitted'}</p>
         ${provisional?`<p class="small-note">* ${record.pending.length} answer${record.pending.length!==1?'s':''} still need${record.pending.length===1?'s':''} your coach's review — this score may change.</p>`:''}
         <button class="btn" data-exit-exam="1" style="margin-top:10px;">Done</button>
       </div>`;
     }
+
+    const qOrder = getShuffledQuestionOrder(exam, name);
+    const idx = record.currentIndex||0;
+    const qid = qOrder[idx];
+    const qq = (exam.questions||[]).find(qz=>qz.id===qid);
+    if(!qq){
+      return `<div class="card"><p class="small-note">Wrapping up…</p></div>`;
+    }
+    const elapsed = Date.now() - (record.questionStartedAt||Date.now());
+    const timeLimitMs = questionTimeLimitSec(qq)*1000;
+    const remainingMs = Math.max(0, timeLimitMs - elapsed);
+
     let html = `<div class="card">
       <div class="flex-between">
         <div>
           <h2 style="margin:0;">${escapeHtml(exam.title)}</h2>
-          <p class="sub" style="margin:2px 0 0;">${escapeHtml(name)}</p>
+          <p class="sub" style="margin:2px 0 0;">${escapeHtml(name)} · Question ${idx+1} of ${qOrder.length}</p>
         </div>
         <div style="text-align:right;">
           <div style="font-size:11px;color:var(--muted);text-transform:uppercase;">Time left</div>
-          <div id="exam-timer-display" class="mono" style="font-size:22px;color:var(--brass-soft);">${formatMs(ui.examAttempt.remainingMs)}</div>
+          <div id="exam-timer-display" class="mono" style="font-size:22px;color:var(--brass-soft);">${formatMs(remainingMs)}</div>
         </div>
       </div>
     </div>`;
 
-    const qOrder = getShuffledQuestionOrder(exam, name);
-    const byId = {}; (exam.questions||[]).forEach(qq=>{ byId[qq.id]=qq; });
-    qOrder.forEach((qid,i)=>{
-      const qq = byId[qid];
-      if(!qq) return;
-      const chosen = record.answers ? record.answers[qq.id] : undefined;
-      html += `<div class="card">
-        <p class="small-note" style="margin-bottom:2px;">Question ${i+1} of ${qOrder.length} · ${escapeHtml(qq.subject)} · ${qq.points||1} pt${(qq.points||1)!==1?'s':''}${(qq.type==='mcq'||qq.type==='true_false')?'':' · no penalty if wrong'}</p>
-        <p style="font-weight:600; margin:4px 0 10px;">${escapeHtml(qq.text)}</p>`;
+    html += `<div class="card">
+      <p class="small-note" style="margin-bottom:2px;">${escapeHtml(qq.subject)} · ${QTYPE_LABELS[qq.type]||qq.type}${qq.type!=='riddle'?` · ${qq.points||1} pt${(qq.points||1)!==1?'s':''}`:''}</p>`;
+
+    if(qq.type==='riddle'){
+      const clues = qq.clues||[];
+      const revealedCount = Math.min(clues.length, Math.floor(elapsed/5000)+1);
+      const nextCluePts = revealedCount<=1 ? 5 : (revealedCount===2 ? 4 : 3);
+      html += `<div id="exam-riddle-clues">`;
+      for(let c=0;c<revealedCount;c++){
+        html += `<p style="margin:4px 0;"><strong>Clue ${c+1}:</strong> ${escapeHtml(clues[c])}</p>`;
+      }
+      html += `</div>
+        <input type="text" id="exam-riddle-input" placeholder="Who or what am I?">
+        <button class="btn btn-brass" style="margin-top:8px;" data-exam-answer-riddle="1">Answer now — worth ${nextCluePts} pt${nextCluePts!==1?'s':''} if correct</button>`;
+    } else {
+      html += `<p style="font-weight:600; margin:4px 0 10px;">${escapeHtml(qq.text)}</p>`;
       if(qq.type==='mcq' || qq.type==='true_false'){
         const order = getShuffledOptionOrder(exam, name, qq);
         order.forEach(oi=>{
           const opt = qq.options[oi];
-          const checked = chosen===oi;
-          html += `<label style="display:flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid var(--hair); border-radius:7px; margin-bottom:6px; cursor:pointer; background:${checked?'var(--panel-2)':'transparent'};">
-            <input type="radio" name="q-${qq.id}" value="${oi}" data-exam-answer="${qq.id}" data-exam-answer-kind="choice" ${checked?'checked':''}>
+          html += `<label style="display:flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid var(--hair); border-radius:7px; margin-bottom:6px; cursor:pointer;">
+            <input type="radio" name="q-current" value="${oi}">
             <span>${escapeHtml(opt)}</span>
           </label>`;
         });
+        html += `<button class="btn btn-brass" style="margin-top:6px;" data-exam-answer-submit="1">Submit answer</button>`;
       } else if(qq.type==='short'){
-        html += `<input type="text" placeholder="Your answer" data-exam-answer="${qq.id}" data-exam-answer-kind="text" value="${escapeAttr(chosen||'')}">`;
+        html += `<input type="text" id="exam-text-input" placeholder="Your answer">
+          <button class="btn btn-brass" style="margin-top:8px;" data-exam-answer-submit="1">Submit answer</button>`;
       } else if(qq.type==='numeric'){
-        html += `<input type="text" placeholder="e.g. 5m^2 — include the unit" data-exam-answer="${qq.id}" data-exam-answer-kind="text" value="${escapeAttr(chosen||'')}">
-          <p class="small-note" style="margin-top:4px;">Include the unit with your answer.</p>`;
+        html += `<input type="text" id="exam-text-input" placeholder="e.g. 5m^2 — include the unit">
+          <p class="small-note" style="margin-top:4px;">Include the unit with your answer.</p>
+          <button class="btn btn-brass" style="margin-top:8px;" data-exam-answer-submit="1">Submit answer</button>`;
       }
-      html += `</div>`;
-    });
-
-    const answeredCount = Object.keys(record.answers||{}).length;
-    html += `<div class="card" style="text-align:center;">
-      <p class="small-note" id="exam-progress">${answeredCount} of ${qOrder.length} answered</p>
-      <button class="btn btn-brass" data-submit-exam="1">Submit exam</button>
-    </div>`;
+    }
+    html += `</div>`;
     return html;
   }
 
@@ -2738,6 +2987,12 @@
     if(finishLiveBtn) finishLiveBtn.addEventListener('click', ()=>{
       finishLiveMatch(parseInt(finishLiveBtn.getAttribute('data-finish-live-match')));
     });
+    qa('[data-substitute-seat]').forEach(el=>el.addEventListener('click', ()=>{
+      performSubstitution(parseInt(el.getAttribute('data-substitute-seat')), false);
+    }));
+    qa('[data-substitute-seat-guest]').forEach(el=>el.addEventListener('click', ()=>{
+      performSubstitution(parseInt(el.getAttribute('data-substitute-seat-guest')), true);
+    }));
 
     const advanceBtn = q('[data-advance-stage]');
     if(advanceBtn) advanceBtn.addEventListener('click', advanceStage);
@@ -2784,7 +3039,8 @@
     if(saveWeightsBtn) saveWeightsBtn.addEventListener('click', saveWeights);
     const addMeetingBtn = q('[data-add-meeting]');
     if(addMeetingBtn) addMeetingBtn.addEventListener('click', addMeeting);
-    qa('[data-toggle-meeting]').forEach(el=>el.addEventListener('click', ()=>{
+    qa('[data-toggle-meeting]').forEach(el=>el.addEventListener('click', (e)=>{
+      if(e.target.closest('[data-stop-row-toggle]')) return;
       const id = el.getAttribute('data-toggle-meeting');
       ui.expandedMeeting = (ui.expandedMeeting===id) ? null : id;
       render();
@@ -2817,17 +3073,8 @@
     // Live exams — take/resume
     qa('[data-take-exam]').forEach(el=>el.addEventListener('click', startOrResumeExam));
     qa('[data-exit-exam]').forEach(el=>el.addEventListener('click', exitExamAttempt));
-    qa('[data-exam-answer]').forEach(el=>{
-      const kind = el.getAttribute('data-exam-answer-kind');
-      const evt = kind==='text' ? 'input' : 'change';
-      el.addEventListener(evt, e=>{
-        const val = kind==='text' ? e.target.value : parseInt(e.target.value);
-        recordExamAnswer(el.getAttribute('data-exam-answer'), val);
-      });
-    });
-    qa('[data-submit-exam]').forEach(el=>el.addEventListener('click', ()=>{
-      openConfirm('Submit this exam?', "You can't change your answers after submitting.", ()=>submitExamAttempt(false));
-    }));
+    qa('[data-exam-answer-submit]').forEach(el=>el.addEventListener('click', submitCurrentAnswer));
+    qa('[data-exam-answer-riddle]').forEach(el=>el.addEventListener('click', submitCurrentAnswer));
 
     // Live exams — staff management
     const toggleExamBuilderBtn = q('[data-toggle-exam-builder]');
@@ -2839,10 +3086,17 @@
     if(createExamBtn) createExamBtn.addEventListener('click', createExam);
     qa('[data-eq-type-select]').forEach(el=>el.addEventListener('change', ()=>{
       const examId = el.getAttribute('data-eq-type-select');
-      ['mcq','true_false','short','numeric'].forEach(t=>{
+      ['mcq','true_false','short','numeric','riddle'].forEach(t=>{
         const grp = document.getElementById(`eq-group-${t}-${examId}`);
         if(grp) grp.style.display = (t===el.value) ? '' : 'none';
       });
+      const isRiddle = el.value==='riddle';
+      const ptsWrap = document.getElementById(`eq-points-wrap-${examId}`);
+      const calcWrap = document.getElementById(`eq-calc-wrap-${examId}`);
+      if(ptsWrap) ptsWrap.style.display = isRiddle ? 'none' : '';
+      if(calcWrap) calcWrap.style.display = isRiddle ? 'none' : '';
+      const ptsEl = document.getElementById(`f-eq-points-${examId}`);
+      if(ptsEl && !isRiddle) ptsEl.value = (el.value==='mcq'||el.value==='true_false') ? 2 : 3;
     }));
     qa('[data-toggle-exam]').forEach(el=>el.addEventListener('click', ()=>{
       const id = el.getAttribute('data-toggle-exam');
@@ -2867,6 +3121,14 @@
     }));
     qa('[data-exam-add-question]').forEach(el=>el.addEventListener('click', ()=>{
       addExamQuestion(el.getAttribute('data-exam-add-question'));
+    }));
+    qa('[data-toggle-exam-bulk]').forEach(el=>el.addEventListener('click', ()=>{
+      const id = el.getAttribute('data-toggle-exam-bulk');
+      ui.examBulkOpen[id] = !ui.examBulkOpen[id];
+      render();
+    }));
+    qa('[data-exam-add-bulk]').forEach(el=>el.addEventListener('click', ()=>{
+      addExamQuestionsBulk(el.getAttribute('data-exam-add-bulk'));
     }));
     qa('[data-exam-delete-question]').forEach(el=>el.addEventListener('click', ()=>{
       const [examId, qid] = el.getAttribute('data-exam-delete-question').split('|');
@@ -2921,6 +3183,12 @@
       ui.expandedProfile = (ui.expandedProfile===name) ? null : name;
       render();
     }));
+    const refreshExamStatsBtn = q('[data-refresh-exam-stats]');
+    if(refreshExamStatsBtn) refreshExamStatsBtn.addEventListener('click', async ()=>{
+      refreshExamStatsBtn.textContent = 'Loading…';
+      await loadExamTypeStats();
+      render();
+    });
     qa('[data-edit-notes]').forEach(el=>el.addEventListener('click', ()=>{
       ui.editingNotesFor = el.getAttribute('data-edit-notes');
       render();
@@ -3205,6 +3473,43 @@
     render();
   }
 
+  // Mid-match substitution: swaps a seat's occupant for a chosen round onward, pulling
+  // from the FULL student roster (not just those originally picked for the tournament).
+  // Earlier rounds keep their recorded scores under whoever actually played them; the
+  // seat's total for standings still combines everyone who ever sat in it.
+  async function performSubstitution(mi, isGuest){
+    if(!ui.isStaff){ alert('Staff or coach access is required to substitute.'); return; }
+    const t = currentTournament;
+    const stage = t.stages[t.currentStageIndex];
+    const m = stage.matches[mi];
+    const seatEl = q(`#f-sub-seat-${mi}`);
+    const roundEl = q(`#f-sub-round-${mi}`);
+    const seatIndex = seatEl ? parseInt(seatEl.value) : 0;
+    const atRoundKey = roundEl ? roundEl.value : ROUND_ORDER[0];
+    let name;
+    if(isGuest){
+      const input = q(`#f-sub-guest-${mi}`);
+      name = (input ? input.value : '').trim();
+    } else {
+      const sel = q(`#f-sub-in-${mi}`);
+      name = sel ? sel.value : '';
+    }
+    if(!name){ toast('Pick or type who\'s coming in.', 'error'); return; }
+    let comp = isGuest ? null : t.competitors.find(c=>c.name===name);
+    if(!comp){
+      comp = { id: uid('c'), name, seed:false, type: isGuest?'guest':'individual' };
+      t.competitors.push(comp);
+    }
+    if(!stage.competitorIds.includes(comp.id)) stage.competitorIds.push(comp.id);
+    const outCid = seatCidForRound(m, seatIndex, atRoundKey);
+    if(outCid===comp.id){ toast(`${name} is already in that seat.`, 'error'); return; }
+    if(!m.substitutions) m.substitutions = [];
+    m.substitutions.push({ seatIndex, outCid, inCid: comp.id, atRoundKey, at: Date.now() });
+    saveCurrentTournament();
+    toast(`${name} substituted in from ${ROUND_INFO[atRoundKey].label} onward.`, 'success');
+    render();
+  }
+
   async function ballotSeats(mi){
     if(!ui.isStaff){ toast('Staff or coach access is required.', 'error'); return; }
     const stage = currentTournament.stages[currentTournament.currentStageIndex];
@@ -3286,6 +3591,8 @@
       for(const s of prevStudents){ await sDelete(`exam_attempt:${ex.id}:${s.name}`); }
     }
     DB.exams = [];
+    DB.examTypeStats = null;
+    DB.examTypeStatsLoadedAt = null;
     await sSet('tournament_index', []);
     await sSet('students', []);
     await sSet('meetings', []);
@@ -3434,46 +3741,62 @@
     }
     return dp[m][n];
   }
-  function gradeQuestionAnswer(question, rawAnswer, negativeMarking, negativePenalty){
-    const pts = question.points||1;
-    if(question.type==='mcq' || question.type==='true_false'){
-      if(rawAnswer===undefined || rawAnswer===null || rawAnswer==='') return {status:'unanswered', earned:0};
-      if(parseInt(rawAnswer)===question.correctIndex) return {status:'correct', earned:pts};
-      return {status:'incorrect', earned: negativeMarking ? -(negativePenalty!=null?negativePenalty:1) : 0};
-    }
-    if(question.type==='short'){
-      const raw = (rawAnswer||'').toString();
-      if(!raw.trim()) return {status:'unanswered', earned:0};
+  function gradeShortLikeAnswer(question, rawAnswer, isNumeric, shortPenalty, overridePoints, overrideCluePts){
+    const raw = (rawAnswer||'').toString();
+    if(!raw.trim()) return {status:'unanswered', earned:0};
+    if(!isNumeric){
       const norm = normalizeText(raw);
       const accepted = (question.acceptedAnswers||[]).map(normalizeText);
-      if(accepted.includes(norm)) return {status:'correct', earned:pts};
+      if(accepted.includes(norm)) return {status:'correct', earned: overridePoints!=null?overridePoints:(question.points||1)};
       let closest=null, closestDist=Infinity;
       accepted.forEach(a=>{ const d=levenshtein(norm,a); if(d<closestDist){ closestDist=d; closest=a; } });
       const threshold = closest!==null ? Math.max(1, Math.round(closest.length*0.2)) : 0;
-      if(closest!==null && closestDist<=threshold){
-        return {status:'pending', earned:0, hint:`Close to "${closest}" — possible typo, check manually`};
-      }
-      return {status:'pending', earned:0, hint:'No exact match on file — review manually'};
+      const hint = (closest!==null && closestDist<=threshold)
+        ? `Close to "${closest}" — possible typo, check manually`
+        : 'No exact match on file — review manually';
+      return {status:'pending', earned:0, hint, penaltyIfWrong:shortPenalty, cluePts:overrideCluePts};
     }
-    if(question.type==='numeric'){
-      const raw = (rawAnswer||'').toString().trim();
-      if(!raw) return {status:'unanswered', earned:0};
-      const m = raw.match(/^(-?\d+(?:\.\d+)?)\s*(.*)$/);
-      if(!m) return {status:'pending', earned:0, hint:"Couldn't read a number from this answer — review manually"};
-      const val = parseFloat(m[1]);
-      const tol = question.tolerance||0;
-      const valOk = Math.abs(val - question.correctValue) <= tol;
-      if(!valOk) return {status:'incorrect', earned:0};
-      if(question.unitRequired){
-        const acceptedUnits = (question.units||[]).map(normalizeUnit).filter(Boolean);
-        const unitPart = normalizeUnit(m[2]);
-        if(acceptedUnits.length===0) return {status:'pending', earned:0, hint:'No accepted units configured for this question — review manually'};
-        if(!unitPart) return {status:'incorrect', earned:0}; // right number, missing unit -> wrong, per NSMQ-style marking
-        if(!acceptedUnits.includes(unitPart)) return {status:'pending', earned:0, hint:`Unit "${m[2].trim()}" isn't in the accepted list — check manually`};
-      }
-      return {status:'correct', earned:pts};
+    const m = raw.trim().match(/^(-?\d+(?:\.\d+)?)\s*(.*)$/);
+    if(!m) return {status:'pending', earned:0, hint:"Couldn't read a number from this answer — review manually", penaltyIfWrong:shortPenalty};
+    const val = parseFloat(m[1]);
+    const tol = question.tolerance||0;
+    if(Math.abs(val-question.correctValue) > tol) return {status:'incorrect', earned:-shortPenalty};
+    if(question.unitRequired){
+      const acceptedUnits = (question.units||[]).map(normalizeUnit).filter(Boolean);
+      const unitPart = normalizeUnit(m[2]);
+      if(acceptedUnits.length===0) return {status:'pending', earned:0, hint:'No accepted units configured — review manually', penaltyIfWrong:shortPenalty};
+      if(!unitPart) return {status:'incorrect', earned:-shortPenalty}; // right number, missing unit -> wrong
+      if(!acceptedUnits.includes(unitPart)) return {status:'pending', earned:0, hint:`Unit "${m[2].trim()}" isn't in the accepted list — check manually`, penaltyIfWrong:shortPenalty};
     }
-    return {status:'pending', earned:0, hint:'Unknown question type'};
+    return {status:'correct', earned: overridePoints!=null?overridePoints:(question.points||1)};
+  }
+
+  function riddleCluePoints(clueIndex){
+    return clueIndex<=1 ? 5 : (clueIndex===2 ? 4 : 3);
+  }
+
+  // Resolves the outcome of a single question at the moment it's answered (or timed
+  // out). Called once per question, immediately — not deferred to the end of the exam —
+  // since the exam is now paced one question at a time.
+  function resolveQuestionOutcome(question, rawAnswer, exam, clueIndex){
+    const mcqPenalty = exam.negativeMarking ? (exam.negativePenalty!=null?exam.negativePenalty:1) : 0;
+    const shortPenalty = exam.shortNegativeMarking ? (exam.shortPenalty!=null?exam.shortPenalty:1) : 0;
+    const pts = question.points||1;
+
+    if(question.type==='mcq' || question.type==='true_false'){
+      if(rawAnswer===undefined || rawAnswer===null || rawAnswer===''){
+        return {status:'unanswered', earned:0};
+      }
+      if(parseInt(rawAnswer)===question.correctIndex) return {status:'correct', earned:pts};
+      return {status:'incorrect', earned:-mcqPenalty};
+    }
+    if(question.type==='short') return gradeShortLikeAnswer(question, rawAnswer, false, shortPenalty);
+    if(question.type==='numeric') return gradeShortLikeAnswer(question, rawAnswer, true, shortPenalty);
+    if(question.type==='riddle'){
+      const cluePts = riddleCluePoints(clueIndex||1);
+      return gradeShortLikeAnswer(question, rawAnswer, false, shortPenalty, cluePts, cluePts);
+    }
+    return {status:'pending', earned:0, hint:'Unknown question type', penaltyIfWrong:0};
   }
 
   function seededRandom(seedStr){
@@ -3511,17 +3834,19 @@
   async function createExam(){
     if(!ui.isStaff) return;
     const titleEl = q('#f-exam-title');
-    const minEl = q('#f-exam-minutes');
     const negMarkEl = q('#f-exam-negmark');
     const negPenEl = q('#f-exam-negpenalty');
+    const shortNegEl = q('#f-exam-shortneg');
+    const shortPenEl = q('#f-exam-shortpenalty');
     const shuffleEl = q('#f-exam-shuffle');
     const title = (titleEl ? titleEl.value : '').trim();
     if(!title){ toast('Give the exam a title.', 'error'); return; }
-    const minutes = minEl ? (parseInt(minEl.value)||30) : 30;
     const negativeMarking = negMarkEl ? !!negMarkEl.checked : true;
     const negativePenalty = negPenEl ? (parseFloat(negPenEl.value)||1) : 1;
+    const shortNegativeMarking = shortNegEl ? !!shortNegEl.checked : true;
+    const shortPenalty = shortPenEl ? (parseFloat(shortPenEl.value)||1) : 1;
     const shuffleQuestions = shuffleEl ? !!shuffleEl.checked : true;
-    const ex = { id: uid('exam'), title, code: genExamCode(), timeLimitMinutes: minutes, status:'draft', createdAt: Date.now(), questions: [], publishedAssessmentId: null, negativeMarking, negativePenalty, shuffleQuestions, studentPins: {} };
+    const ex = { id: uid('exam'), title, code: genExamCode(), status:'draft', createdAt: Date.now(), questions: [], publishedAssessmentId: null, negativeMarking, negativePenalty, shortNegativeMarking, shortPenalty, shuffleQuestions, studentPins: {} };
     if(!DB.exams) DB.exams = [];
     DB.exams.push(ex);
     await sSet('exams', DB.exams);
@@ -3541,6 +3866,75 @@
     render();
   }
 
+  // Parses one bulk-import line into a question object, or returns an error string.
+  function parseBulkQuestionLine(line){
+    const parts = line.split('||').map(s=>s.trim());
+    const kind = (parts[0]||'').toUpperCase();
+    const yn = v => /^y/i.test((v||'').trim());
+    try{
+      if(kind==='MCQ'){
+        const [, subject, text, a, b, c, d, correctLetter, pts, calc] = parts;
+        if(!subject||!text||!a||!b||!c||!d||!correctLetter) return {error:'MCQ needs subject, text, 4 options, and a correct letter'};
+        const idx = {A:0,B:1,C:2,D:3}[correctLetter.trim().toUpperCase()];
+        if(idx===undefined) return {error:`Correct letter "${correctLetter}" must be A, B, C, or D`};
+        return {question:{ id:uid('q'), subject, type:'mcq', text, options:[a,b,c,d], correctIndex:idx, points: parseFloat(pts)||2, requiresCalculation: yn(calc) }};
+      }
+      if(kind==='TF'){
+        const [, subject, text, answer, pts, calc] = parts;
+        if(!subject||!text||!answer) return {error:'TF needs subject, statement, and True/False'};
+        const isTrue = /^t/i.test(answer.trim());
+        return {question:{ id:uid('q'), subject, type:'true_false', text, options:['True','False'], correctIndex:isTrue?0:1, points: parseFloat(pts)||2, requiresCalculation: yn(calc) }};
+      }
+      if(kind==='SHORT'){
+        const [, subject, text, accepted, pts, calc] = parts;
+        if(!subject||!text||!accepted) return {error:'SHORT needs subject, question, and accepted answer(s)'};
+        return {question:{ id:uid('q'), subject, type:'short', text, acceptedAnswers: accepted.split(';').map(s=>s.trim()).filter(Boolean), points: parseFloat(pts)||3, requiresCalculation: yn(calc) }};
+      }
+      if(kind==='NUMERIC'){
+        const [, subject, text, value, tol, units, unitReq, pts, calc] = parts;
+        if(!subject||!text||value===undefined||value==='') return {error:'NUMERIC needs subject, question, and value'};
+        const unitRequired = unitReq===undefined ? true : yn(unitReq);
+        const unitList = (units||'').split(';').map(s=>s.trim()).filter(Boolean);
+        if(unitRequired && unitList.length===0) return {error:'NUMERIC with unit required needs at least one accepted unit'};
+        return {question:{ id:uid('q'), subject, type:'numeric', text, correctValue: parseFloat(value), tolerance: parseFloat(tol)||0, units: unitList, unitRequired, points: parseFloat(pts)||3, requiresCalculation: yn(calc) }};
+      }
+      if(kind==='RIDDLE'){
+        const [, subject, cluesRaw, acceptedRaw] = parts;
+        const clues = (cluesRaw||'').split(';').map(s=>s.trim()).filter(Boolean);
+        const accepted = (acceptedRaw||'').split(';').map(s=>s.trim()).filter(Boolean);
+        if(!subject||clues.length===0||accepted.length===0) return {error:'RIDDLE needs subject, at least one clue, and accepted answer(s)'};
+        return {question:{ id:uid('q'), subject, type:'riddle', text:`Riddle (${clues.length} clues)`, clues, acceptedAnswers:accepted, points:5, requiresCalculation:false }};
+      }
+      return {error:`Unknown question type "${parts[0]}"`};
+    } catch(e){
+      return {error:'Could not parse this line'};
+    }
+  }
+
+  async function addExamQuestionsBulk(examId){
+    if(!ui.isStaff) return;
+    const ex = (DB.exams||[]).find(e=>e.id===examId);
+    if(!ex) return;
+    const textEl = q(`#f-eq-bulk-${examId}`);
+    const raw = textEl ? textEl.value : '';
+    const lines = raw.split('\n').map(l=>l.trim()).filter(l=>l && !l.startsWith('#'));
+    if(lines.length===0){ toast('Paste at least one question line.', 'error'); return; }
+    let added=0; const errors=[];
+    lines.forEach((line,i)=>{
+      const result = parseBulkQuestionLine(line);
+      if(result.question){ ex.questions.push(result.question); added++; }
+      else errors.push(`Line ${i+1}: ${result.error}`);
+    });
+    if(added>0){ await sSet('exams', DB.exams); }
+    if(errors.length===0){
+      toast(`Added ${added} question${added!==1?'s':''}.`, 'success');
+      if(textEl) textEl.value = '';
+    } else {
+      toast(`Added ${added}, skipped ${errors.length}: ${errors.slice(0,3).join(' · ')}${errors.length>3?'…':''}`, 'error');
+    }
+    render();
+  }
+
   async function addExamQuestion(examId){
     if(!ui.isStaff) return;
     const ex = (DB.exams||[]).find(e=>e.id===examId);
@@ -3549,45 +3943,61 @@
     const subjEl = q(`#f-eq-subject-${examId}`);
     const textEl = q(`#f-eq-text-${examId}`);
     const ptsEl = q(`#f-eq-points-${examId}`);
+    const calcEl = q(`#f-eq-calc-${examId}`);
     const type = typeEl ? typeEl.value : 'mcq';
     const subject = subjEl ? subjEl.value : SUBJECTS[0];
-    const text = (textEl ? textEl.value : '').trim();
     const points = ptsEl ? (parseFloat(ptsEl.value)||1) : 1;
-    if(!text){ toast('Add the question text.', 'error'); return; }
-    let question = { id: uid('q'), subject, type, text, points };
+    const requiresCalculation = calcEl ? !!calcEl.checked : false;
+    let question = { id: uid('q'), subject, type, points, requiresCalculation };
 
-    if(type==='mcq'){
-      const optEls = [0,1,2,3].map(i=>q(`#f-eq-opt-${examId}-${i}`));
-      const correctEl = q(`input[name="f-eq-correct-${examId}"]:checked`);
-      const options = optEls.map(el=>(el ? el.value : '').trim());
-      if(options.some(o=>!o)){ toast('Fill in all 4 options.', 'error'); return; }
-      if(!correctEl){ toast('Mark which option is correct.', 'error'); return; }
-      question.options = options;
-      question.correctIndex = parseInt(correctEl.value);
-    } else if(type==='true_false'){
-      const correctEl = q(`input[name="f-eq-tf-${examId}"]:checked`);
-      if(!correctEl){ toast('Mark whether True or False is correct.', 'error'); return; }
-      question.options = ['True','False'];
-      question.correctIndex = parseInt(correctEl.value);
-    } else if(type==='short'){
-      const acceptedEl = q(`#f-eq-short-accepted-${examId}`);
+    if(type==='riddle'){
+      const cluesEl = q(`#f-eq-riddle-clues-${examId}`);
+      const acceptedEl = q(`#f-eq-riddle-accepted-${examId}`);
+      const clues = (cluesEl ? cluesEl.value : '').split('\n').map(s=>s.trim()).filter(Boolean);
       const accepted = (acceptedEl ? acceptedEl.value : '').split('|').map(s=>s.trim()).filter(Boolean);
+      if(clues.length===0){ toast('Add at least one clue, one per line.', 'error'); return; }
       if(accepted.length===0){ toast('Enter at least one accepted answer.', 'error'); return; }
+      question.text = `Riddle (${clues.length} clue${clues.length!==1?'s':''})`;
+      question.clues = clues;
       question.acceptedAnswers = accepted;
-    } else if(type==='numeric'){
-      const valEl = q(`#f-eq-num-value-${examId}`);
-      const tolEl = q(`#f-eq-num-tol-${examId}`);
-      const unitsEl = q(`#f-eq-num-units-${examId}`);
-      const unitReqEl = q(`#f-eq-num-unitreq-${examId}`);
-      const correctValue = valEl ? parseFloat(valEl.value) : NaN;
-      if(isNaN(correctValue)){ toast('Enter the correct numeric value.', 'error'); return; }
-      const unitRequired = unitReqEl ? !!unitReqEl.checked : true;
-      const units = (unitsEl ? unitsEl.value : '').split('|').map(s=>s.trim()).filter(Boolean);
-      if(unitRequired && units.length===0){ toast('List at least one accepted unit, or untick "unit required".', 'error'); return; }
-      question.correctValue = correctValue;
-      question.tolerance = tolEl ? (parseFloat(tolEl.value)||0) : 0;
-      question.units = units;
-      question.unitRequired = unitRequired;
+      question.points = 5; // best case (answered on clue 1); actual award is 5/4/3 based on clues revealed
+    } else {
+      const text = (textEl ? textEl.value : '').trim();
+      if(!text){ toast('Add the question text.', 'error'); return; }
+      question.text = text;
+      if(type==='mcq'){
+        const optEls = [0,1,2,3].map(i=>q(`#f-eq-opt-${examId}-${i}`));
+        const correctEl = q(`input[name="f-eq-correct-${examId}"]:checked`);
+        const options = optEls.map(el=>(el ? el.value : '').trim());
+        if(options.some(o=>!o)){ toast('Fill in all 4 options.', 'error'); return; }
+        if(!correctEl){ toast('Mark which option is correct.', 'error'); return; }
+        question.options = options;
+        question.correctIndex = parseInt(correctEl.value);
+      } else if(type==='true_false'){
+        const correctEl = q(`input[name="f-eq-tf-${examId}"]:checked`);
+        if(!correctEl){ toast('Mark whether True or False is correct.', 'error'); return; }
+        question.options = ['True','False'];
+        question.correctIndex = parseInt(correctEl.value);
+      } else if(type==='short'){
+        const acceptedEl = q(`#f-eq-short-accepted-${examId}`);
+        const accepted = (acceptedEl ? acceptedEl.value : '').split('|').map(s=>s.trim()).filter(Boolean);
+        if(accepted.length===0){ toast('Enter at least one accepted answer.', 'error'); return; }
+        question.acceptedAnswers = accepted;
+      } else if(type==='numeric'){
+        const valEl = q(`#f-eq-num-value-${examId}`);
+        const tolEl = q(`#f-eq-num-tol-${examId}`);
+        const unitsEl = q(`#f-eq-num-units-${examId}`);
+        const unitReqEl = q(`#f-eq-num-unitreq-${examId}`);
+        const correctValue = valEl ? parseFloat(valEl.value) : NaN;
+        if(isNaN(correctValue)){ toast('Enter the correct numeric value.', 'error'); return; }
+        const unitRequired = unitReqEl ? !!unitReqEl.checked : true;
+        const units = (unitsEl ? unitsEl.value : '').split('|').map(s=>s.trim()).filter(Boolean);
+        if(unitRequired && units.length===0){ toast('List at least one accepted unit, or untick "unit required".', 'error'); return; }
+        question.correctValue = correctValue;
+        question.tolerance = tolEl ? (parseFloat(tolEl.value)||0) : 0;
+        question.units = units;
+        question.unitRequired = unitRequired;
+      }
     }
 
     ex.questions.push(question);
@@ -3639,10 +4049,10 @@
       let status = 'Not started', score=null, maxScore=null, pending=false;
       if(rec){
         if(rec.submitted){
-          status = rec.autoSubmitted ? 'Submitted (auto)' : 'Submitted';
+          status = rec.timedOutCount ? `Submitted (${rec.timedOutCount} timed out)` : 'Submitted';
           score = rec.score; maxScore = rec.maxScore;
           if(rec.pending && rec.pending.length){ pending = true; pendingCount += rec.pending.length; }
-        } else status = 'In progress';
+        } else status = `In progress (Q${(rec.currentIndex||0)+1})`;
       }
       rows.push({ name: s.name, status, score, maxScore, pending });
     }
@@ -3676,7 +4086,7 @@
     if(idx<0) return;
     const item = rec.pending[idx];
     rec.pending.splice(idx,1);
-    const earned = decision==='correct' ? item.points : 0;
+    const earned = decision==='correct' ? item.points : -(item.penaltyIfWrong||0);
     rec.score = (rec.score||0) + earned;
     if(!rec.subjectScores) rec.subjectScores = {};
     if(!rec.subjectScores[item.subject]) rec.subjectScores[item.subject] = {earned:0, max:item.points};
@@ -3692,7 +4102,7 @@
     const ex = (DB.exams||[]).find(e=>e.id===examId);
     if(!ex) return;
     const subjectMax = {}; SUBJECTS.forEach(s=>{ subjectMax[s]=0; });
-    (ex.questions||[]).forEach(qq=>{ subjectMax[qq.subject] = (subjectMax[qq.subject]||0) + (qq.points||1); });
+    (ex.questions||[]).forEach(qq=>{ subjectMax[qq.subject] = (subjectMax[qq.subject]||0) + (qq.type==='riddle'?5:(qq.points||1)); });
     const scores = {};
     let anySubmitted = false;
     let stillPending = 0;
@@ -3719,7 +4129,7 @@
     render();
   }
 
-  /* ============================= LIVE EXAMS: TAKING ============================= */
+  /* ============================= LIVE EXAMS: TAKING (paced, one question at a time) ============================= */
   let examTimerInterval = null;
   function stopExamTimer(){
     if(examTimerInterval){ clearInterval(examTimerInterval); examTimerInterval = null; }
@@ -3728,15 +4138,27 @@
     stopExamTimer();
     examTimerInterval = setInterval(()=>{
       if(!ui.examAttempt){ stopExamTimer(); return; }
-      const remaining = ui.examAttempt.record.deadline - Date.now();
-      ui.examAttempt.remainingMs = Math.max(0, remaining);
+      const {exam, name, record} = ui.examAttempt;
+      if(record.submitted){ stopExamTimer(); return; }
+      const qOrder = getShuffledQuestionOrder(exam, name);
+      const qq = (exam.questions||[]).find(qz=>qz.id===qOrder[record.currentIndex||0]);
+      if(!qq){ stopExamTimer(); return; }
+      const elapsed = Date.now() - (record.questionStartedAt||Date.now());
+      const timeLimitMs = questionTimeLimitSec(qq)*1000;
+      const remaining = timeLimitMs - elapsed;
       if(remaining<=0){
-        stopExamTimer();
-        submitExamAttempt(true);
+        timeoutCurrentQuestion(); // async; next tick(s) read the updated state
         return;
       }
       const el = document.getElementById('exam-timer-display');
-      if(el) el.textContent = formatMs(ui.examAttempt.remainingMs);
+      if(el) el.textContent = formatMs(remaining);
+      if(qq.type==='riddle'){
+        const revealedCount = Math.min((qq.clues||[]).length, Math.floor(elapsed/5000)+1);
+        if(revealedCount !== ui.examLastRevealedCount){
+          ui.examLastRevealedCount = revealedCount;
+          render();
+        }
+      }
     }, 1000);
   }
 
@@ -3762,50 +4184,103 @@
     const now = Date.now();
     if(record && record.submitted){
       stopExamTimer();
-      ui.examAttempt = { exam: ex, name, record, remainingMs: 0 };
+      ui.examAttempt = { exam: ex, name, record };
       render();
       return;
     }
     if(!record){
       if(ex.status!=='open'){ ui.examTakeError = 'This exam is not currently open.'; render(); return; }
-      record = { examId: ex.id, name, startedAt: now, deadline: now + ex.timeLimitMinutes*60000, answers:{}, submitted:false, submittedAt:null, score:null, maxScore:null, subjectScores:null, pending:[], autoSubmitted:false };
+      record = { examId: ex.id, name, startedAt: now, currentIndex:0, questionStartedAt: now, perQuestionResults:{}, submitted:false, submittedAt:null, score:null, maxScore:null, subjectScores:null, pending:[], timedOutCount:0 };
       await sSet(`exam_attempt:${ex.id}:${name}`, record);
     }
-    const remainingMs = Math.max(0, record.deadline - now);
-    ui.examAttempt = { exam: ex, name, record, remainingMs };
+    ui.examLastRevealedCount = null;
+    ui.examAttempt = { exam: ex, name, record };
+
+    // Catch up on any question(s) that fully timed out while the student was away.
+    const qOrder = getShuffledQuestionOrder(ex, name);
+    let guard = 0;
+    while(ui.examAttempt && !ui.examAttempt.record.submitted && guard < qOrder.length+1){
+      guard++;
+      const idx = ui.examAttempt.record.currentIndex||0;
+      if(idx >= qOrder.length){ await finalizeExamAttempt(); break; }
+      const qq = (ex.questions||[]).find(qz=>qz.id===qOrder[idx]);
+      if(!qq) break;
+      const elapsed = now - (ui.examAttempt.record.questionStartedAt||now);
+      if(elapsed >= questionTimeLimitSec(qq)*1000){
+        await timeoutCurrentQuestion();
+      } else break;
+    }
+    if(ui.examAttempt && !ui.examAttempt.record.submitted) startExamTimer();
     render();
-    if(remainingMs<=0){ await submitExamAttempt(true); }
-    else { startExamTimer(); }
   }
 
-  function persistExamAttempt(){
+  async function persistExamAttempt(){
     if(!ui.examAttempt) return;
     const {exam, name, record} = ui.examAttempt;
-    sSet(`exam_attempt:${exam.id}:${name}`, record);
+    await sSet(`exam_attempt:${exam.id}:${name}`, record);
   }
 
-  function recordExamAnswer(qid, val){
+  async function advanceOrFinalize(){
     if(!ui.examAttempt) return;
-    if(!ui.examAttempt.record.answers) ui.examAttempt.record.answers = {};
-    ui.examAttempt.record.answers[qid] = val;
-    qa(`input[name="q-${qid}"]`).forEach(inp=>{
-      const label = inp.closest('label');
-      if(label) label.style.background = inp.checked ? 'var(--panel-2)' : 'transparent';
-    });
-    updateExamProgress();
-    persistExamAttempt();
-  }
-
-  function updateExamProgress(){
-    const progressEl = document.getElementById('exam-progress');
-    if(progressEl && ui.examAttempt){
-      const count = Object.keys(ui.examAttempt.record.answers||{}).length;
-      const total = getShuffledQuestionOrder(ui.examAttempt.exam, ui.examAttempt.name).length;
-      progressEl.textContent = `${count} of ${total} answered`;
+    const {exam, name, record} = ui.examAttempt;
+    const qOrder = getShuffledQuestionOrder(exam, name);
+    record.currentIndex = (record.currentIndex||0) + 1;
+    record.questionStartedAt = Date.now();
+    ui.examLastRevealedCount = null;
+    if(record.currentIndex >= qOrder.length){
+      await finalizeExamAttempt();
+    } else {
+      await persistExamAttempt();
+      render();
     }
   }
 
-  async function submitExamAttempt(auto){
+  async function answerCurrentQuestion(rawAnswer, clueIndex, isTimeout){
+    if(!ui.examAttempt) return;
+    const {exam, name, record} = ui.examAttempt;
+    const qOrder = getShuffledQuestionOrder(exam, name);
+    const qid = qOrder[record.currentIndex||0];
+    if(!qid) return;
+    if(!record.perQuestionResults) record.perQuestionResults = {};
+    if(record.perQuestionResults[qid]) return; // guard against double-submit
+    const qq = (exam.questions||[]).find(qz=>qz.id===qid);
+    if(!qq) return;
+    const outcome = resolveQuestionOutcome(qq, rawAnswer, exam, clueIndex);
+    record.perQuestionResults[qid] = { ...outcome, rawAnswer: rawAnswer||'', timedOut: !!isTimeout };
+    if(isTimeout) record.timedOutCount = (record.timedOutCount||0) + 1;
+    await advanceOrFinalize();
+  }
+
+  async function timeoutCurrentQuestion(){
+    await answerCurrentQuestion(undefined, undefined, true);
+  }
+
+  async function submitCurrentAnswer(){
+    if(!ui.examAttempt) return;
+    const {exam, name, record} = ui.examAttempt;
+    const qOrder = getShuffledQuestionOrder(exam, name);
+    const qq = (exam.questions||[]).find(qz=>qz.id===qOrder[record.currentIndex||0]);
+    if(!qq) return;
+    if(qq.type==='mcq' || qq.type==='true_false'){
+      const checked = q('input[name="q-current"]:checked');
+      if(!checked){ toast('Pick an option first.', 'error'); return; }
+      await answerCurrentQuestion(checked.value, undefined, false);
+    } else if(qq.type==='riddle'){
+      const inputEl = q('#exam-riddle-input');
+      const raw = inputEl ? inputEl.value : '';
+      if(!raw.trim()){ toast('Type your answer first.', 'error'); return; }
+      const elapsed = Date.now() - (record.questionStartedAt||Date.now());
+      const revealedCount = Math.min((qq.clues||[]).length, Math.floor(elapsed/5000)+1);
+      await answerCurrentQuestion(raw, revealedCount, false);
+    } else {
+      const inputEl = q('#exam-text-input');
+      const raw = inputEl ? inputEl.value : '';
+      if(!raw.trim()){ toast('Type your answer first.', 'error'); return; }
+      await answerCurrentQuestion(raw, undefined, false);
+    }
+  }
+
+  async function finalizeExamAttempt(){
     if(!ui.examAttempt) return;
     stopExamTimer();
     const {exam, name, record} = ui.examAttempt;
@@ -3814,17 +4289,17 @@
     const subjectScores = {};
     const pending = [];
     (exam.questions||[]).forEach(qq=>{
-      const pts = qq.points||1;
-      maxScore += pts;
+      const maxPts = qq.type==='riddle' ? 5 : (qq.points||1);
+      maxScore += maxPts;
       if(!subjectScores[qq.subject]) subjectScores[qq.subject] = {earned:0, max:0};
-      subjectScores[qq.subject].max += pts;
-      const raw = record.answers ? record.answers[qq.id] : undefined;
-      const result = gradeQuestionAnswer(qq, raw, exam.negativeMarking, exam.negativePenalty);
-      if(result.status==='pending'){
-        pending.push({ qid: qq.id, subject: qq.subject, points: pts, rawAnswer: raw, hint: result.hint });
+      subjectScores[qq.subject].max += maxPts;
+      const res = (record.perQuestionResults||{})[qq.id];
+      if(!res) return; // shouldn't normally happen
+      if(res.status==='pending'){
+        pending.push({ qid: qq.id, subject: qq.subject, points: res.cluePts!=null?res.cluePts:maxPts, rawAnswer: res.rawAnswer, hint: res.hint, penaltyIfWrong: res.penaltyIfWrong||0 });
       } else {
-        score += result.earned;
-        subjectScores[qq.subject].earned += result.earned;
+        score += res.earned;
+        subjectScores[qq.subject].earned += res.earned;
       }
     });
     record.submitted = true;
@@ -3833,10 +4308,9 @@
     record.maxScore = maxScore;
     record.subjectScores = subjectScores;
     record.pending = pending;
-    record.autoSubmitted = !!auto;
     await sSet(`exam_attempt:${exam.id}:${name}`, record);
     ui.examAttempt = { exam, name, record };
-    toast(auto ? "Time's up — exam auto-submitted." : 'Exam submitted.', auto?'info':'success');
+    toast('Exam submitted.', 'success');
     render();
   }
 
@@ -3903,7 +4377,8 @@
     const stage = t.stages[t.currentStageIndex];
     const m = stage.matches[mi];
     if(!m.live){ toast('Nothing scored yet.', 'error'); return; }
-    const totals = computeLiveTotals(m, m.slots);
+    const seatTotals = computeSeatTotals(m);
+    const totals = {}; m.slots.forEach((cid,i)=>{ totals[cid] = seatTotals[i]; });
     const ranked = computeRanksFromScores(totals);
     const anyTie = Object.values(ranked).some(r=>r.tied);
     m.results = ranked;
