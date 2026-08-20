@@ -394,7 +394,7 @@
   }
 
   /* ============================= APP STATE ============================= */
-  let DB = { students: [], tIndex: [], pins: {coach:null, staff:null, scorer:null}, meetings: [], assessments: [], weights: {attendance:30, assessment:30, quiz:40}, notes: {}, exams: [], examTypeStats: null, examTypeStatsBySubject: null, examTypeStatsLoadedAt: null, auditLog: [] };
+  let DB = { students: [], tIndex: [], pins: {coach:null, staff:null, scorer:null}, meetings: [], assessments: [], weights: {attendance:30, assessment:30, quiz:40}, notes: {}, exams: [], examTypeStats: null, examTypeStatsBySubject: null, examTypeStatsLoadedAt: null, auditLog: [], studentPins: {} };
 
   // Appends a short, human-readable entry to the shared audit log — who did what, when.
   // Kept intentionally lightweight (no full diffs) so it stays cheap to write and read.
@@ -418,6 +418,7 @@
     isScorer:false,         // true for 'coach','staff','scorer' — can record match results
     pinModal:null,          // {mode:'setup'|'unlock', value:'', error:''}
     settingsOpen:false,     // whether the coach Settings (PIN management) panel is open
+    pinsPanelOpen:false,    // whether the Student PINs panel is open
     qualifySelection:null,  // array of cids currently ticked to advance
     qualifySelectionStage:null, // which stage.key the selection belongs to
     editingNameCid:null,    // competitor id currently being renamed
@@ -1010,6 +1011,9 @@
       });
     }
 
+    if(ui.isStaff){
+      html += renderStudentPinsCard();
+    }
     if(ui.isCoach){
       html += `<div class="divider"></div>
         <div class="card">
@@ -1027,6 +1031,31 @@
         </div>`;
       if(ui.settingsOpen) html += renderSettingsPanel();
     }
+    return html;
+  }
+
+  function renderStudentPinsCard(){
+    const pins = DB.studentPins||{};
+    const missing = DB.students.filter(s=>!pins[s.name]).length;
+    let html = `<div class="divider"></div>
+      <div class="card">
+        <div class="flex-between"><h2>Student PINs</h2>
+          <button class="btn btn-sm ${ui.pinsPanelOpen?'btn-brass':'btn-ghost'}" data-toggle-pins-panel="1">${ui.pinsPanelOpen?'▾ Hide':'Show'}</button>
+        </div>
+        <p class="sub">One PIN per student, the same for every exam — no need to reissue a new one each time. Only regenerate if a PIN gets shared or something looks off.</p>`;
+    if(ui.pinsPanelOpen){
+      html += `<div class="row" style="align-items:center;">
+        <div style="flex:0;"><button class="btn btn-sm btn-brass" data-gen-missing-pins="1">Generate for anyone missing one${missing?` (${missing})`:''}</button></div>
+        <div style="flex:0;"><button class="btn btn-sm btn-danger" data-reset-all-pins="1">Reset everyone's PIN</button></div>
+      </div>
+      <div style="margin-top:10px; max-height:280px; overflow-y:auto;">
+        <table><thead><tr><th>Student</th><th>PIN</th><th></th></tr></thead><tbody>
+        ${DB.students.slice().sort((a,b)=>a.name.localeCompare(b.name)).map(s=>`<tr><td>${escapeHtml(s.name)}</td><td class="mono">${pins[s.name]?escapeHtml(pins[s.name]):'—'}</td><td><button class="btn btn-sm btn-ghost" data-reset-one-pin="${escapeAttr(s.name)}">Reset</button></td></tr>`).join('')}
+        </tbody></table>
+      </div>
+      <p class="small-note" style="margin-top:8px;">Share each PIN privately (DM, printed slip) — never in a group chat, or the whole point is defeated.</p>`;
+    }
+    html += `</div>`;
     return html;
   }
 
@@ -2581,7 +2610,20 @@
       html += `<div class="row" style="margin-top:10px;">
         <div><input type="text" id="f-exam-title" placeholder="Exam title (e.g. Biology Take-Home Test 1)"></div>
       </div>
-      <p class="small-note" style="margin-top:6px;">Timing is set per question, not for the whole exam — see below.</p>
+      <div class="row" style="margin-top:8px;">
+        <div><label class="field">Mode</label><select id="f-exam-mode" data-exam-mode-select="1">
+          <option value="self_paced">Self-paced — each student moves at their own speed</option>
+          <option value="reader">Reader-led — coach reads the question, everyone answers together</option>
+        </select></div>
+      </div>
+      <p class="small-note" style="margin-top:6px;">In reader-led mode there's no shuffling and no per-question countdown — you control when the group moves to the next question from a host screen.</p>
+      <div id="f-exam-timing-group">
+        <div class="row" style="margin-top:8px;">
+          <div><label class="field">No-calculation questions</label><input type="number" id="f-exam-nocalc-sec" min="3" value="15"> <span class="small-note">seconds</span></div>
+          <div><label class="field">Calculation questions</label><input type="number" id="f-exam-calc-sec" min="5" value="35"> <span class="small-note">seconds</span></div>
+          <div><label class="field">Riddle, per clue</label><input type="number" id="f-exam-clue-sec" min="2" value="5"> <span class="small-note">seconds</span></div>
+        </div>
+      </div>
       <div class="row" style="margin-top:8px; align-items:center;">
         <div style="flex:0; display:flex; align-items:center; gap:6px;"><input type="checkbox" id="f-exam-negmark" checked style="width:auto;"><label for="f-exam-negmark" style="margin:0; font-size:13px;">MCQ / True-False: penalize wrong answers</label></div>
         <div style="max-width:90px;"><input type="number" id="f-exam-negpenalty" value="1" min="0" step="0.5" title="Points deducted per wrong MCQ/True-False answer"></div>
@@ -2590,10 +2632,10 @@
         <div style="flex:0; display:flex; align-items:center; gap:6px;"><input type="checkbox" id="f-exam-shortneg" checked style="width:auto;"><label for="f-exam-shortneg" style="margin:0; font-size:13px;">Short answer / numeric / riddle: penalize wrong answers</label></div>
         <div style="max-width:90px;"><input type="number" id="f-exam-shortpenalty" value="1" min="0" step="0.5" title="Points deducted per wrong short-answer/numeric/riddle answer"></div>
       </div>
-      <div class="row" style="margin-top:6px; align-items:center;">
+      <div class="row" style="margin-top:6px; align-items:center;" id="f-exam-shuffle-row">
         <div style="flex:0; display:flex; align-items:center; gap:6px;"><input type="checkbox" id="f-exam-shuffle" checked style="width:auto;"><label for="f-exam-shuffle" style="margin:0; font-size:13px;">Shuffle question &amp; option order per student</label></div>
       </div>
-      <p class="small-note" style="margin-top:6px;">Running out the clock loses the marks for that question but does not trigger the wrong-answer penalty — only an answer that's actually submitted and wrong does.</p>
+      <p class="small-note" style="margin-top:6px;">Running out the clock loses the marks for that question but does not trigger the wrong-answer penalty — only an answer that's actually submitted and wrong does. Selecting an MCQ/True-False option submits it immediately and moves to the next question.</p>
       <div class="row" style="margin-top:8px;"><div style="flex:0;"><button class="btn btn-brass" data-create-exam="1">Create</button></div></div>`;
     }
     html += `</div>`;
@@ -2608,12 +2650,15 @@
 
   const QTYPE_LABELS = { mcq:'Multiple choice', true_false:'True / False', short:'Short answer', numeric:'Numeric (with units)', riddle:'Riddle (clue-by-clue)' };
 
-  function questionTimeLimitSec(qq){
-    if(qq.type==='riddle') return (qq.clues||[]).length*5 + 5;
-    return qq.requiresCalculation ? 35 : 15;
+  function questionTimeLimitSec(qq, exam){
+    const noCalcSec = (exam && exam.noCalcSeconds) || 15;
+    const calcSec = (exam && exam.calcSeconds) || 35;
+    const clueSec = (exam && exam.riddleClueSeconds) || 5;
+    if(qq.type==='riddle') return (qq.clues||[]).length*clueSec + clueSec;
+    return qq.requiresCalculation ? calcSec : noCalcSec;
   }
 
-  function renderQuestionSummary(qq){
+  function renderQuestionSummary(qq, exam){
     let detail = '';
     if(qq.type==='mcq' || qq.type==='true_false'){
       detail = `Correct: ${escapeHtml((qq.options||[])[qq.correctIndex]||'')}`;
@@ -2625,7 +2670,7 @@
     } else if(qq.type==='riddle'){
       detail = `${(qq.clues||[]).length} clue${(qq.clues||[]).length!==1?'s':''} · answer: ${(qq.acceptedAnswers||[]).map(escapeHtml).join(', ')} · 5/4/3 pts by clue reached`;
     }
-    const timing = qq.type==='riddle' ? `${questionTimeLimitSec(qq)}s total` : `${questionTimeLimitSec(qq)}s${qq.requiresCalculation?' (calculation)':''}`;
+    const timing = qq.type==='riddle' ? `${questionTimeLimitSec(qq,exam)}s total` : `${questionTimeLimitSec(qq,exam)}s${qq.requiresCalculation?' (calculation)':''}`;
     return `<span class="pill">${escapeHtml(qq.subject)}</span> <span class="pill" style="opacity:.75;">${QTYPE_LABELS[qq.type]||qq.type}</span> <span class="pill" style="opacity:.75;">${timing}</span> <span style="font-size:13px;">${escapeHtml(qq.text)}</span>
       <div class="small-note" style="margin-top:2px;">${detail}${qq.type!=='riddle'?` · ${qq.points||1} pt${(qq.points||1)!==1?'s':''}`:''}</div>`;
   }
@@ -2651,25 +2696,15 @@
     if(ex.status==='draft') html += `<div style="flex:0;"><button class="btn btn-sm btn-brass" data-exam-open="${ex.id}">Open exam (students can start)</button></div>`;
     if(ex.status==='open') html += `<div style="flex:0;"><button class="btn btn-sm" data-exam-close="${ex.id}">Close (stop new starts)</button></div>`;
     if(ex.status==='closed') html += `<div style="flex:0;"><button class="btn btn-sm" data-exam-open="${ex.id}">Reopen</button></div>`;
-    html += `<div style="flex:0;"><button class="btn btn-sm" data-exam-gen-pins="${ex.id}">${ex.studentPins && Object.keys(ex.studentPins).length ? 'Refresh' : 'Generate'} student PINs</button></div>`;
     if(ui.isCoach) html += `<div style="flex:0;"><button class="btn btn-sm btn-danger" data-exam-delete="${ex.id}">Delete exam</button></div>`;
     html += `</div>`;
-
-    if(ex.studentPins && Object.keys(ex.studentPins).length){
-      html += `<details style="margin-top:10px;"><summary class="small-note" style="cursor:pointer;">Show student PINs (${Object.keys(ex.studentPins).length}) — send each privately, not in a group chat</summary>
-        <div style="margin-top:8px; max-height:220px; overflow-y:auto;">
-        <table><thead><tr><th>Student</th><th>PIN</th></tr></thead><tbody>
-        ${Object.keys(ex.studentPins).sort().map(n=>`<tr><td>${escapeHtml(n)}</td><td class="mono">${escapeHtml(ex.studentPins[n])}</td></tr>`).join('')}
-        </tbody></table></div>
-      </details>`;
-    } else {
-      html += `<p class="small-note" style="margin-top:8px;">No PINs generated yet — click "Generate student PINs" and DM each student their own PIN before opening the exam. This is what stops someone else from writing under a classmate's name.</p>`;
-    }
+    html += `<p class="small-note" style="margin-top:8px;">Students sign in with their own PIN — same one every exam. Manage PINs from Home → Data &amp; access → Student PINs.</p>`;
+    if(ex.mode==='reader') html += renderReaderConsole(ex);
 
     html += `<div class="divider"></div><h3 class="display" style="font-size:14px;margin:0 0 8px;">Questions</h3>`;
     (ex.questions||[]).forEach(qq=>{
       html += `<div class="row" style="align-items:flex-start; margin-bottom:8px;">
-        <div style="flex:1;">${renderQuestionSummary(qq)}</div>
+        <div style="flex:1;">${renderQuestionSummary(qq, ex)}</div>
         <div style="flex:0;"><button class="btn btn-sm btn-danger" data-exam-delete-question="${ex.id}|${qq.id}">✕</button></div>
       </div>`;
     });
@@ -2748,6 +2783,38 @@
         <p style="margin:0; font-weight:600; color:${statusColor};">${statusLabel}${res.status!=='pending'?` · ${res.earned>=0?'+':''}${res.earned} pt${Math.abs(res.earned)!==1?'s':''}`:''}</p>
       </div>`;
     });
+    return html;
+  }
+
+  function renderReaderConsole(ex){
+    const idx = ex.readerIndex||0;
+    const qq = (ex.questions||[])[idx];
+    let html = `<div class="card" style="background:var(--panel); margin-top:10px;">
+      <h3 style="margin:0 0 8px; font-size:14px;">Reader console — question ${idx+1} of ${(ex.questions||[]).length}</h3>`;
+    if(qq){
+      html += `<p class="small-note" style="margin:0 0 4px;">${escapeHtml(qq.subject)} · ${QTYPE_LABELS[qq.type]||qq.type}</p>`;
+      if(qq.type==='riddle'){
+        html += `<div style="margin:0 0 8px;">${(qq.clues||[]).map((c,i)=>`<p style="margin:2px 0; font-size:13px;"><strong>Clue ${i+1}:</strong> ${escapeHtml(c)}</p>`).join('')}
+          <p class="small-note">Accepted: ${(qq.acceptedAnswers||[]).map(escapeHtml).join(', ')}</p></div>`;
+      } else {
+        html += `<p style="font-weight:600; margin:0 0 8px;">${escapeHtml(qq.text)}</p>`;
+        if(qq.type==='mcq' || qq.type==='true_false'){
+          html += `<ul style="margin:0 0 8px; padding-left:18px;">${(qq.options||[]).map((o,i)=>`<li>${i===qq.correctIndex?'<strong>':''}${escapeHtml(o)}${i===qq.correctIndex?' ✓</strong>':''}</li>`).join('')}</ul>`;
+        } else if(qq.acceptedAnswers){
+          html += `<p class="small-note" style="margin:0 0 8px;">Accepted: ${qq.acceptedAnswers.map(escapeHtml).join(', ')}</p>`;
+        } else if(qq.correctValue!=null){
+          html += `<p class="small-note" style="margin:0 0 8px;">Answer: ${qq.correctValue}${qq.tolerance?` (±${qq.tolerance})`:''}${qq.units&&qq.units.length?' '+escapeHtml(qq.units.join(' / ')):''}</p>`;
+        }
+      }
+    } else {
+      html += `<p class="small-note">No questions in this exam yet.</p>`;
+    }
+    html += `<div class="row">
+      <div style="flex:0;"><button class="btn btn-sm" data-reader-prev="${ex.id}" ${idx<=0?'disabled':''}>← Previous</button></div>
+      <div style="flex:0;"><button class="btn btn-sm btn-brass" data-reader-next="${ex.id}" ${idx>=(ex.questions||[]).length-1?'disabled':''}>Next question →</button></div>
+      <div style="flex:0;"><button class="btn btn-sm btn-danger" data-reader-finish="${ex.id}">Finish exam for everyone</button></div>
+    </div>`;
+    html += `</div>`;
     return html;
   }
 
@@ -2848,6 +2915,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
         <button class="btn" data-exit-exam="1" style="margin-top:10px;">Done</button>
       </div>`;
     }
+    if(exam.mode==='reader') return renderReaderExamTaking(exam, name, record);
 
     const qOrder = getShuffledQuestionOrder(exam, name);
     const idx = record.currentIndex||0;
@@ -2857,7 +2925,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
       return `<div class="card"><p class="small-note">Wrapping up…</p></div>`;
     }
     const elapsed = Date.now() - (record.questionStartedAt||Date.now());
-    const timeLimitMs = questionTimeLimitSec(qq)*1000;
+    const timeLimitMs = questionTimeLimitSec(qq, exam)*1000;
     const remainingMs = Math.max(0, timeLimitMs - elapsed);
 
     let html = `<div class="card">
@@ -2878,7 +2946,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
 
     if(qq.type==='riddle'){
       const clues = qq.clues||[];
-      const revealedCount = Math.min(clues.length, Math.floor(elapsed/5000)+1);
+      const revealedCount = Math.min(clues.length, Math.floor(elapsed/((exam.riddleClueSeconds||5)*1000))+1);
       const nextCluePts = revealedCount<=1 ? 5 : (revealedCount===2 ? 4 : 3);
       html += `<div id="exam-riddle-clues">`;
       for(let c=0;c<revealedCount;c++){
@@ -2894,11 +2962,11 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
         order.forEach(oi=>{
           const opt = qq.options[oi];
           html += `<label style="display:flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid var(--hair); border-radius:7px; margin-bottom:6px; cursor:pointer;">
-            <input type="radio" name="q-current" value="${oi}">
+            <input type="radio" name="q-current" value="${oi}" data-exam-answer-choice="1">
             <span>${escapeHtml(opt)}</span>
           </label>`;
         });
-        html += `<button class="btn btn-brass" style="margin-top:6px;" data-exam-answer-submit="1">Submit answer</button>`;
+        html += `<p class="small-note" style="margin-top:4px;">Tap an option to answer — it submits instantly and moves you on.</p>`;
       } else if(qq.type==='short'){
         html += `<input type="text" id="exam-text-input" placeholder="Your answer">
           <button class="btn btn-brass" style="margin-top:8px;" data-exam-answer-submit="1">Submit answer</button>`;
@@ -2906,6 +2974,51 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
         html += `<input type="text" id="exam-text-input" placeholder="e.g. 5m^2 — include the unit">
           <p class="small-note" style="margin-top:4px;">Include the unit with your answer.</p>
           <button class="btn btn-brass" style="margin-top:8px;" data-exam-answer-submit="1">Submit answer</button>`;
+      }
+    }
+    html += `</div>`;
+    return html;
+  }
+
+  function renderReaderExamTaking(exam, name, record){
+    const idx = exam.readerIndex||0;
+    const qq = (exam.questions||[])[idx];
+    let html = `<div class="card">
+      <h2 style="margin:0;">${escapeHtml(exam.title)}</h2>
+      <p class="sub" style="margin:2px 0 0;">${escapeHtml(name)} · Question ${idx+1} of ${(exam.questions||[]).length} · reader-led</p>
+    </div>`;
+    if(!qq){
+      html += `<div class="card" style="text-align:center;"><p class="small-note">Waiting for the coach to start the first question…</p></div>`;
+      return html;
+    }
+    const already = record.perQuestionResults && record.perQuestionResults[qq.id];
+    if(already){
+      html += `<div class="card" style="text-align:center;"><p class="small-note">✓ Answer locked in — waiting for the coach to move to the next question.</p></div>`;
+      return html;
+    }
+    html += `<div class="card">
+      <p class="small-note" style="margin-bottom:2px;">${escapeHtml(qq.subject)} · ${QTYPE_LABELS[qq.type]||qq.type}${qq.type!=='riddle'?` · ${qq.points||1} pt${(qq.points||1)!==1?'s':''}`:''}</p>`;
+    if(qq.type==='riddle'){
+      html += `<div>${(qq.clues||[]).map((c,i)=>`<p style="margin:4px 0;"><strong>Clue ${i+1}:</strong> ${escapeHtml(c)}</p>`).join('')}</div>
+        <input type="text" id="exam-text-input" placeholder="Your answer">
+        <button class="btn btn-brass" style="margin-top:8px;" data-exam-answer-submit-reader="1">Submit answer</button>`;
+    } else {
+      html += `<p style="font-weight:600; margin:4px 0 10px;">${escapeHtml(qq.text)}</p>`;
+      if(qq.type==='mcq' || qq.type==='true_false'){
+        (qq.options||[]).forEach((opt,oi)=>{
+          html += `<label style="display:flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid var(--hair); border-radius:7px; margin-bottom:6px; cursor:pointer;">
+            <input type="radio" name="q-current" value="${oi}" data-exam-answer-choice-reader="1">
+            <span>${escapeHtml(opt)}</span>
+          </label>`;
+        });
+        html += `<p class="small-note" style="margin-top:4px;">Tap an option to lock in your answer.</p>`;
+      } else if(qq.type==='numeric'){
+        html += `<input type="text" id="exam-text-input" placeholder="e.g. 5m^2 — include the unit">
+          <p class="small-note" style="margin-top:4px;">Include the unit with your answer.</p>
+          <button class="btn btn-brass" style="margin-top:8px;" data-exam-answer-submit-reader="1">Submit answer</button>`;
+      } else {
+        html += `<input type="text" id="exam-text-input" placeholder="Your answer">
+          <button class="btn btn-brass" style="margin-top:8px;" data-exam-answer-submit-reader="1">Submit answer</button>`;
       }
     }
     html += `</div>`;
@@ -3275,6 +3388,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     qa('[data-exit-exam]').forEach(el=>el.addEventListener('click', exitExamAttempt));
     qa('[data-exam-answer-submit]').forEach(el=>el.addEventListener('click', submitCurrentAnswer));
     qa('[data-exam-answer-riddle]').forEach(el=>el.addEventListener('click', submitCurrentAnswer));
+    qa('[data-exam-answer-choice]').forEach(el=>el.addEventListener('change', submitCurrentAnswer));
 
     // Live exams — staff management
     const toggleExamBuilderBtn = q('[data-toggle-exam-builder]');
@@ -3284,6 +3398,13 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     });
     const createExamBtn = q('[data-create-exam]');
     if(createExamBtn) createExamBtn.addEventListener('click', createExam);
+    qa('[data-exam-mode-select]').forEach(el=>el.addEventListener('change', ()=>{
+      const isReader = el.value==='reader';
+      const timingGroup = document.getElementById('f-exam-timing-group');
+      const shuffleRow = document.getElementById('f-exam-shuffle-row');
+      if(timingGroup) timingGroup.style.display = isReader ? 'none' : '';
+      if(shuffleRow) shuffleRow.style.display = isReader ? 'none' : '';
+    }));
     qa('[data-eq-type-select]').forEach(el=>el.addEventListener('change', ()=>{
       const examId = el.getAttribute('data-eq-type-select');
       ['mcq','true_false','short','numeric','riddle'].forEach(t=>{
@@ -3315,10 +3436,18 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
       const id = el.getAttribute('data-exam-delete');
       openConfirm('Delete this exam?', 'This removes the exam, its questions, and every student attempt permanently.', ()=>deleteExam(id));
     }));
-    qa('[data-exam-gen-pins]').forEach(el=>el.addEventListener('click', ()=>{
-      const id = el.getAttribute('data-exam-gen-pins');
-      openConfirm('Generate student PINs?', 'This assigns (or reassigns) a private PIN to every current student for this exam. Share each one individually — not in a group chat — or anyone with the exam code could start under someone else\'s name.', ()=>generateExamPins(id));
+    qa('[data-reader-prev]').forEach(el=>el.addEventListener('click', ()=>{
+      readerAdvance(el.getAttribute('data-reader-prev'), -1);
     }));
+    qa('[data-reader-next]').forEach(el=>el.addEventListener('click', ()=>{
+      readerAdvance(el.getAttribute('data-reader-next'), 1);
+    }));
+    qa('[data-reader-finish]').forEach(el=>el.addEventListener('click', ()=>{
+      const id = el.getAttribute('data-reader-finish');
+      openConfirm('Finish this exam for everyone?', 'Scores every student who has an in-progress attempt right now, using whatever they\'ve answered so far, and closes the exam.', ()=>readerFinishForAll(id));
+    }));
+    qa('[data-exam-answer-submit-reader]').forEach(el=>el.addEventListener('click', submitReaderAnswer));
+    qa('[data-exam-answer-choice-reader]').forEach(el=>el.addEventListener('change', submitReaderAnswer));
     qa('[data-exam-add-question]').forEach(el=>el.addEventListener('click', ()=>{
       addExamQuestion(el.getAttribute('data-exam-add-question'));
     }));
@@ -3445,6 +3574,18 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     if(toggleSettingsBtn) toggleSettingsBtn.addEventListener('click', ()=>{ ui.settingsOpen = !ui.settingsOpen; render(); });
     const closeSettingsBtn = q('[data-close-settings]');
     if(closeSettingsBtn) closeSettingsBtn.addEventListener('click', ()=>{ ui.settingsOpen = false; render(); });
+    const togglePinsPanelBtn = q('[data-toggle-pins-panel]');
+    if(togglePinsPanelBtn) togglePinsPanelBtn.addEventListener('click', ()=>{ ui.pinsPanelOpen = !ui.pinsPanelOpen; render(); });
+    const genMissingPinsBtn = q('[data-gen-missing-pins]');
+    if(genMissingPinsBtn) genMissingPinsBtn.addEventListener('click', generateMissingStudentPins);
+    const resetAllPinsBtn = q('[data-reset-all-pins]');
+    if(resetAllPinsBtn) resetAllPinsBtn.addEventListener('click', ()=>{
+      openConfirm('Reset every student PIN?', 'Every student will need their new PIN before they can start their next exam. Redistribute privately.', resetAllStudentPins);
+    });
+    qa('[data-reset-one-pin]').forEach(el=>el.addEventListener('click', ()=>{
+      const name = el.getAttribute('data-reset-one-pin');
+      openConfirm(`Reset ${name}'s PIN?`, `${name} will need the new PIN before starting their next exam.`, ()=>resetStudentPin(name));
+    }));
     qa('[data-save-pin]').forEach(el=>el.addEventListener('click', ()=>{
       savePinForRole(el.getAttribute('data-save-pin'));
     }));
@@ -4061,6 +4202,34 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     }
     return dp[m][n];
   }
+  function commonPrefixLen(a,b){
+    let i=0; while(i<a.length && i<b.length && a[i]===b[i]) i++; return i;
+  }
+
+  // Decides whether a wrong short-answer/riddle response is close enough to be worth a
+  // human glancing at (typo, partial phrase, missing word) versus outright unrelated —
+  // so "osmosis" for "gravitational force" is marked wrong immediately, while "gravity"
+  // or a misspelled "graviational force" gets queued for a quick manual look.
+  function findCloseAcceptedAnswer(norm, accepted){
+    let closest=null, closestDist=Infinity, isClose=false;
+    accepted.forEach(a=>{
+      if(!a) return;
+      const d = levenshtein(norm, a);
+      if(d<closestDist){ closestDist=d; closest=a; }
+      const ratio = d/Math.max(norm.length, a.length, 1);
+      const substringMatch = a.length>=4 && (norm.includes(a) || a.includes(norm));
+      const wordsA = a.split(' ').filter(w=>w.length>=4);
+      const wordsN = norm.split(' ').filter(w=>w.length>=4);
+      const sharedWord = wordsA.some(wa=>wordsN.some(wn=>wa===wn || levenshtein(wa,wn)<=1));
+      const prefixClose = wordsA.some(wa=>wordsN.some(wn=>{
+        const pre = commonPrefixLen(wa,wn);
+        return pre>=5 && pre/Math.min(wa.length,wn.length)>=0.7;
+      }));
+      if(ratio<=0.34 || substringMatch || sharedWord || prefixClose) isClose = true;
+    });
+    return { closest, isClose };
+  }
+
   function gradeShortLikeAnswer(question, rawAnswer, isNumeric, shortPenalty, overridePoints, overrideCluePts){
     const raw = (rawAnswer||'').toString();
     if(!raw.trim()) return {status:'unanswered', earned:0};
@@ -4068,13 +4237,11 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
       const norm = normalizeText(raw);
       const accepted = (question.acceptedAnswers||[]).map(normalizeText);
       if(accepted.includes(norm)) return {status:'correct', earned: overridePoints!=null?overridePoints:(question.points||1)};
-      let closest=null, closestDist=Infinity;
-      accepted.forEach(a=>{ const d=levenshtein(norm,a); if(d<closestDist){ closestDist=d; closest=a; } });
-      const threshold = closest!==null ? Math.max(1, Math.round(closest.length*0.2)) : 0;
-      const hint = (closest!==null && closestDist<=threshold)
-        ? `Close to "${closest}" — possible typo, check manually`
-        : 'No exact match on file — review manually';
-      return {status:'pending', earned:0, hint, penaltyIfWrong:shortPenalty, cluePts:overrideCluePts};
+      const {closest, isClose} = findCloseAcceptedAnswer(norm, accepted);
+      if(isClose){
+        return {status:'pending', earned:0, hint:`Close to "${closest}" — possible typo or partial answer, check manually`, penaltyIfWrong:shortPenalty, cluePts:overrideCluePts};
+      }
+      return {status:'incorrect', earned:-shortPenalty};
     }
     const m = raw.trim().match(/^(-?\d+(?:\.\d+)?)\s*(.*)$/);
     if(!m) return {status:'pending', earned:0, hint:"Couldn't read a number from this answer — review manually", penaltyIfWrong:shortPenalty};
@@ -4154,19 +4321,27 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
   async function createExam(){
     if(!ui.isStaff) return;
     const titleEl = q('#f-exam-title');
+    const modeEl = q('#f-exam-mode');
     const negMarkEl = q('#f-exam-negmark');
     const negPenEl = q('#f-exam-negpenalty');
     const shortNegEl = q('#f-exam-shortneg');
     const shortPenEl = q('#f-exam-shortpenalty');
     const shuffleEl = q('#f-exam-shuffle');
+    const noCalcEl = q('#f-exam-nocalc-sec');
+    const calcEl = q('#f-exam-calc-sec');
+    const clueEl = q('#f-exam-clue-sec');
     const title = (titleEl ? titleEl.value : '').trim();
     if(!title){ toast('Give the exam a title.', 'error'); return; }
+    const mode = modeEl ? modeEl.value : 'self_paced';
     const negativeMarking = negMarkEl ? !!negMarkEl.checked : true;
     const negativePenalty = negPenEl ? (parseFloat(negPenEl.value)||1) : 1;
     const shortNegativeMarking = shortNegEl ? !!shortNegEl.checked : true;
     const shortPenalty = shortPenEl ? (parseFloat(shortPenEl.value)||1) : 1;
-    const shuffleQuestions = shuffleEl ? !!shuffleEl.checked : true;
-    const ex = { id: uid('exam'), title, code: genExamCode(), status:'draft', createdAt: Date.now(), questions: [], publishedAssessmentId: null, negativeMarking, negativePenalty, shortNegativeMarking, shortPenalty, shuffleQuestions, studentPins: {} };
+    const shuffleQuestions = mode==='reader' ? false : (shuffleEl ? !!shuffleEl.checked : true);
+    const noCalcSeconds = noCalcEl ? (parseInt(noCalcEl.value)||15) : 15;
+    const calcSeconds = calcEl ? (parseInt(calcEl.value)||35) : 35;
+    const riddleClueSeconds = clueEl ? (parseInt(clueEl.value)||5) : 5;
+    const ex = { id: uid('exam'), title, mode, code: genExamCode(), status:'draft', createdAt: Date.now(), questions: [], publishedAssessmentId: null, negativeMarking, negativePenalty, shortNegativeMarking, shortPenalty, shuffleQuestions, noCalcSeconds, calcSeconds, riddleClueSeconds, studentPins: {}, readerIndex: 0 };
     if(!DB.exams) DB.exams = [];
     DB.exams.push(ex);
     await sSet('exams', DB.exams);
@@ -4175,14 +4350,71 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     render();
   }
 
-  async function generateExamPins(examId){
+  // Student PINs are now persistent per student (not regenerated per exam) — same PIN
+  // works across every exam until the coach explicitly resets it (e.g. if compromised).
+  async function ensureStudentPins(){
+    if(!DB.studentPins) DB.studentPins = {};
+    let changed = false;
+    DB.students.forEach(s=>{
+      if(!DB.studentPins[s.name]){ DB.studentPins[s.name] = generatePin(); changed = true; }
+    });
+    if(changed) await sSet('student_pins', DB.studentPins);
+    return changed;
+  }
+
+  async function generateMissingStudentPins(){
+    if(!ui.isStaff) return;
+    const changed = await ensureStudentPins();
+    toast(changed ? 'PINs generated for any student missing one.' : 'Everyone already has a PIN.', 'success');
+    render();
+  }
+
+  async function resetStudentPin(name){
+    if(!ui.isStaff) return;
+    if(!DB.studentPins) DB.studentPins = {};
+    DB.studentPins[name] = generatePin();
+    await sSet('student_pins', DB.studentPins);
+    logAudit('Reset student PIN', name);
+    toast(`New PIN generated for ${name}.`, 'success');
+    render();
+  }
+
+  async function resetAllStudentPins(){
+    if(!ui.isStaff) return;
+    if(!DB.studentPins) DB.studentPins = {};
+    DB.students.forEach(s=>{ DB.studentPins[s.name] = generatePin(); });
+    await sSet('student_pins', DB.studentPins);
+    logAudit('Reset ALL student PINs', `${DB.students.length} students`);
+    toast('Every student has a new PIN — redistribute them privately.', 'success');
+    render();
+  }
+
+  async function readerAdvance(examId, delta){
     if(!ui.isStaff) return;
     const ex = (DB.exams||[]).find(e=>e.id===examId);
     if(!ex) return;
-    if(!ex.studentPins) ex.studentPins = {};
-    DB.students.forEach(s=>{ ex.studentPins[s.name] = generatePin(); });
+    const max = (ex.questions||[]).length-1;
+    ex.readerIndex = Math.max(0, Math.min(max, (ex.readerIndex||0)+delta));
     await sSet('exams', DB.exams);
-    toast('PINs generated — send each one privately (not in a group chat).', 'success');
+    render();
+  }
+
+  async function readerFinishForAll(examId){
+    if(!ui.isStaff) return;
+    const ex = (DB.exams||[]).find(e=>e.id===examId);
+    if(!ex) return;
+    let count = 0;
+    for(const s of DB.students){
+      const rec = await sGet(`exam_attempt:${examId}:${s.name}`);
+      if(!rec || rec.submitted) continue;
+      finalizeAttemptScore(ex, rec);
+      await sSet(`exam_attempt:${examId}:${s.name}`, rec);
+      count++;
+    }
+    ex.status = 'closed';
+    await sSet('exams', DB.exams);
+    logAudit('Finished reader exam for all', `${ex.title} (${count} student${count!==1?'s':''} scored)`);
+    toast(`Exam finished — ${count} student${count!==1?'s':''} scored. See Live results.`, 'success');
     render();
   }
 
@@ -4494,7 +4726,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
       const qq = (exam.questions||[]).find(qz=>qz.id===qOrder[record.currentIndex||0]);
       if(!qq){ stopExamTimer(); return; }
       const elapsed = Date.now() - (record.questionStartedAt||Date.now());
-      const timeLimitMs = questionTimeLimitSec(qq)*1000;
+      const timeLimitMs = questionTimeLimitSec(qq, exam)*1000;
       const remaining = timeLimitMs - elapsed;
       if(remaining<=0){
         timeoutCurrentQuestion(); // async; next tick(s) read the updated state
@@ -4503,7 +4735,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
       const el = document.getElementById('exam-timer-display');
       if(el) el.textContent = formatMs(remaining);
       if(qq.type==='riddle'){
-        const revealedCount = Math.min((qq.clues||[]).length, Math.floor(elapsed/5000)+1);
+        const revealedCount = Math.min((qq.clues||[]).length, Math.floor(elapsed/((exam.riddleClueSeconds||5)*1000))+1);
         if(revealedCount !== ui.examLastRevealedCount){
           ui.examLastRevealedCount = revealedCount;
           revealNextRiddleClueInPlace(qq, revealedCount);
@@ -4523,17 +4755,22 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     if(!code || !name){ ui.examTakeError = 'Pick your name and enter the exam code.'; render(); return; }
     const exams = await sGet('exams');
     if(exams) DB.exams = exams;
+    const studentPins = await sGet('student_pins');
+    if(studentPins) DB.studentPins = studentPins;
     const ex = (DB.exams||[]).find(e=>e.code && e.code.toUpperCase()===code);
     if(!ex){ ui.examTakeError = 'No exam found with that code.'; render(); return; }
     if(!ex.questions || ex.questions.length===0){ ui.examTakeError = 'This exam has no questions yet — check with your coach.'; render(); return; }
-    if(ex.studentPins && Object.prototype.hasOwnProperty.call(ex.studentPins, name)){
-      if(!pin){ ui.examTakeError = 'Enter the PIN your coach gave you.'; render(); return; }
-      if(pin !== ex.studentPins[name]){ ui.examTakeError = 'That PIN doesn\'t match this name — check with your coach.'; render(); return; }
+    // Student-level PINs persist across exams — only exam-level pins from before this
+    // feature existed fall back to the old per-exam value.
+    const requiredPin = (DB.studentPins && DB.studentPins[name]) || (ex.studentPins && ex.studentPins[name]);
+    if(requiredPin){
+      if(!pin){ ui.examTakeError = 'Enter your PIN.'; render(); return; }
+      if(pin !== requiredPin){ ui.examTakeError = 'That PIN doesn\'t match this name — check with your coach.'; render(); return; }
     }
     let record = await sGet(`exam_attempt:${ex.id}:${name}`);
     const now = Date.now();
     if(record && record.submitted){
-      stopExamTimer();
+      stopExamTimer(); stopReaderPoll();
       ui.examAttempt = { exam: ex, name, record };
       render();
       return;
@@ -4546,6 +4783,12 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     ui.examLastRevealedCount = null;
     ui.examAttempt = { exam: ex, name, record };
 
+    if(ex.mode==='reader'){
+      startReaderPoll();
+      render();
+      return;
+    }
+
     // Catch up on any question(s) that fully timed out while the student was away.
     const qOrder = getShuffledQuestionOrder(ex, name);
     let guard = 0;
@@ -4556,11 +4799,59 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
       const qq = (ex.questions||[]).find(qz=>qz.id===qOrder[idx]);
       if(!qq) break;
       const elapsed = now - (ui.examAttempt.record.questionStartedAt||now);
-      if(elapsed >= questionTimeLimitSec(qq)*1000){
+      if(elapsed >= questionTimeLimitSec(qq, ex)*1000){
         await timeoutCurrentQuestion();
       } else break;
     }
     if(ui.examAttempt && !ui.examAttempt.record.submitted) startExamTimer();
+    render();
+  }
+
+  let examReaderPollInterval = null;
+  function stopReaderPoll(){
+    if(examReaderPollInterval){ clearInterval(examReaderPollInterval); examReaderPollInterval = null; }
+  }
+  function startReaderPoll(){
+    stopReaderPoll();
+    examReaderPollInterval = setInterval(async ()=>{
+      if(!ui.examAttempt){ stopReaderPoll(); return; }
+      const {exam, name} = ui.examAttempt;
+      let freshEx = exam, rec = ui.examAttempt.record;
+      try{
+        const exams = await sGet('exams');
+        const found = (exams||[]).find(e=>e.id===exam.id);
+        if(found) freshEx = found;
+        const freshRec = await sGet(`exam_attempt:${exam.id}:${name}`);
+        if(freshRec) rec = freshRec;
+      } catch(e){ /* transient network hiccup — try again next tick */ }
+      const changed = freshEx.readerIndex!==ui.examAttempt.exam.readerIndex || rec.submitted!==ui.examAttempt.record.submitted || JSON.stringify(rec.perQuestionResults)!==JSON.stringify(ui.examAttempt.record.perQuestionResults);
+      ui.examAttempt.exam = freshEx;
+      ui.examAttempt.record = rec;
+      if(rec.submitted) stopReaderPoll();
+      if(changed) render();
+    }, 2500);
+  }
+
+  async function submitReaderAnswer(){
+    if(!ui.examAttempt) return;
+    const {exam, name, record} = ui.examAttempt;
+    const qq = (exam.questions||[])[exam.readerIndex||0];
+    if(!qq) return;
+    let raw;
+    if(qq.type==='mcq' || qq.type==='true_false'){
+      const checked = q('input[name="q-current"]:checked');
+      if(!checked){ toast('Pick an option first.', 'error'); return; }
+      raw = checked.value;
+    } else {
+      const inputEl = q('#exam-text-input');
+      raw = inputEl ? inputEl.value : '';
+      if(!raw.trim()){ toast('Type your answer first.', 'error'); return; }
+    }
+    if(!record.perQuestionResults) record.perQuestionResults = {};
+    if(record.perQuestionResults[qq.id]) return; // already answered — guard double submit
+    const outcome = resolveQuestionOutcome(qq, raw, exam, qq.type==='riddle' ? 1 : undefined);
+    record.perQuestionResults[qq.id] = { ...outcome, rawAnswer: raw||'', timedOut:false };
+    await sSet(`exam_attempt:${exam.id}:${name}`, record);
     render();
   }
 
@@ -4620,7 +4911,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
       const raw = inputEl ? inputEl.value : '';
       if(!raw.trim()){ toast('Type your answer first.', 'error'); return; }
       const elapsed = Date.now() - (record.questionStartedAt||Date.now());
-      const revealedCount = Math.min((qq.clues||[]).length, Math.floor(elapsed/5000)+1);
+      const revealedCount = Math.min((qq.clues||[]).length, Math.floor(elapsed/((exam.riddleClueSeconds||5)*1000))+1);
       await answerCurrentQuestion(raw, revealedCount, false);
     } else {
       const inputEl = q('#exam-text-input');
@@ -4630,11 +4921,11 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     }
   }
 
-  async function finalizeExamAttempt(){
-    if(!ui.examAttempt) return;
-    stopExamTimer();
-    const {exam, name, record} = ui.examAttempt;
-    if(record.submitted) return;
+  // Aggregates whatever's in record.perQuestionResults into a final score/subject
+  // breakdown/pending list and marks the record submitted. Shared by both the self-paced
+  // finalize (triggered by the student finishing) and the reader-mode batch finalize
+  // (triggered by the coach ending the session for everyone at once).
+  function finalizeAttemptScore(exam, record){
     let score=0, maxScore=0;
     const subjectScores = {};
     const pending = [];
@@ -4644,7 +4935,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
       if(!subjectScores[qq.subject]) subjectScores[qq.subject] = {earned:0, max:0};
       subjectScores[qq.subject].max += maxPts;
       const res = (record.perQuestionResults||{})[qq.id];
-      if(!res) return; // shouldn't normally happen
+      if(!res) return; // never reached/answered
       if(res.status==='pending'){
         pending.push({ qid: qq.id, subject: qq.subject, points: res.cluePts!=null?res.cluePts:maxPts, rawAnswer: res.rawAnswer, hint: res.hint, penaltyIfWrong: res.penaltyIfWrong||0 });
       } else {
@@ -4658,6 +4949,15 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     record.maxScore = maxScore;
     record.subjectScores = subjectScores;
     record.pending = pending;
+    return record;
+  }
+
+  async function finalizeExamAttempt(){
+    if(!ui.examAttempt) return;
+    stopExamTimer();
+    const {exam, name, record} = ui.examAttempt;
+    if(record.submitted) return;
+    finalizeAttemptScore(exam, record);
     await sSet(`exam_attempt:${exam.id}:${name}`, record);
     ui.examAttempt = { exam, name, record };
     toast('Exam submitted.', 'success');
@@ -4666,6 +4966,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
 
   function exitExamAttempt(){
     stopExamTimer();
+    stopReaderPoll();
     ui.examAttempt = null;
     render();
   }
@@ -4793,6 +5094,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     const notes = await sGet('student_notes');
     const exams = await sGet('exams');
     const auditLog = await sGet('audit_log');
+    const studentPins = await sGet('student_pins');
     if(students){
       DB.students = students;
     } else if(legacyRoster && legacyRoster.length){
@@ -4808,6 +5110,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     DB.notes = notes || {};
     DB.exams = exams || [];
     DB.auditLog = auditLog || [];
+    DB.studentPins = studentPins || {};
     if(accessPins){
       DB.pins = accessPins;
     } else if(legacyCoachPin){
