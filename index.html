@@ -39,7 +39,7 @@
     --radius:10px;
   }
   *{box-sizing:border-box;}
-  body{margin:0;}
+  body{margin:0; background:var(--ink);}
   #app{
     background:var(--ink);
     color:var(--text);
@@ -1644,7 +1644,7 @@
       ui.qualifySelectionStage = stage.key;
     }
 
-    let html = `<table><thead><tr>
+    let html = `<div style="overflow-x:auto;"><table><thead><tr>
       ${showQualifyCheckboxes?'<th></th>':''}
       <th>#</th><th>Name</th><th>Played</th><th>Pts</th><th>Score</th><th>Form</th>
     </tr></thead><tbody>`;
@@ -1661,7 +1661,7 @@
         <td><div class="form-dots">${s.ranks.map(r=>`<span class="form-dot form-${r}"></span>`).join('')}</div></td>
       </tr>`;
     });
-    html += `</tbody></table>`;
+    html += `</tbody></table></div>`;
     html += `<div style="display:flex; gap:8px; margin-top:10px; flex-wrap:wrap;">
       <button class="btn btn-sm" data-share-whatsapp="${stageIdx}">📤 Share to WhatsApp</button>
       <button class="btn btn-sm btn-ghost" data-export-csv="${stageIdx}">⬇ Download CSV</button>
@@ -2440,7 +2440,7 @@
     if(rows.length===0){
       html += `<p class="small-note">No students on the roster yet — add contestants through a tournament, or add them directly below.</p>`;
     } else {
-      html += `<table><thead><tr><th>#</th><th>Name</th><th>Attendance</th><th>Assessments</th><th>Quiz</th><th>Aggregate</th></tr></thead><tbody>`;
+      html += `<div style="overflow-x:auto;"><table><thead><tr><th>#</th><th>Name</th><th>Attendance</th><th>Assessments</th><th>Quiz</th><th>Aggregate</th></tr></thead><tbody>`;
       rows.forEach((r,i)=>{
         html += `<tr>
           <td class="rank-num">${i+1}</td>
@@ -2451,7 +2451,7 @@
           <td class="mono" style="color:var(--brass-soft);font-weight:700;">${r.agg!=null?r.agg.toFixed(1)+'%':'—'}</td>
         </tr>`;
       });
-      html += `</tbody></table>`;
+      html += `</tbody></table></div>`;
     }
     if(DB.students.length===0){
       html += `<div class="divider"></div><p class="small-note">No students in the registry yet — add them on the <a class="link-btn" data-nav="students">Students</a> tab first.</p>`;
@@ -2720,11 +2720,11 @@
     if(ui.examMonitor && ui.examMonitor.examId===ex.id){
       const mon = ui.examMonitor;
       html += `<p class="small-note" style="margin:6px 0;">${mon.submittedCount} of ${DB.students.length} submitted${mon.avg!=null?` · average ${Math.round(mon.avg)}%`:''}${mon.pendingCount?` · <strong>${mon.pendingCount} answer${mon.pendingCount!==1?'s':''} need review</strong>`:''}</p>`;
-      html += `<table><thead><tr><th>Student</th><th>Status</th><th>Score</th><th></th></tr></thead><tbody>`;
+      html += `<div style="overflow-x:auto;"><table><thead><tr><th>Student</th><th>Status</th><th>Score</th><th></th></tr></thead><tbody>`;
       mon.rows.slice().sort((a,b)=>a.name.localeCompare(b.name)).forEach(r=>{
         html += `<tr><td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.status)}</td><td class="mono">${r.score!=null?r.score+'/'+r.maxScore+(r.pending?' *':''):'—'}</td><td>${r.score!=null?`<button class="btn btn-sm btn-ghost" data-exam-view-transcript="${ex.id}|${escapeAttr(r.name)}">View answers</button>`:''}</td></tr>`;
       });
-      html += `</tbody></table>`;
+      html += `</tbody></table></div>`;
       if(mon.pendingCount>0) html += `<p class="small-note" style="margin-top:4px;">* provisional — includes unreviewed short-answer/numeric/riddle responses</p>`;
       html += `<div class="row" style="margin-top:10px;">
         <div style="flex:0;"><button class="btn btn-sm ${mon.pendingCount?'btn-brass':''}" data-exam-review="${ex.id}">Review ${mon.pendingCount?`(${mon.pendingCount})`:'answers'}</button></div>
