@@ -442,7 +442,13 @@
     examTakeError:null,     // error message on the student "enter code" screen
     examAttempt:null,       // {exam, name, record} — the student's in-progress attempt, held client-side
     examLastRevealedCount:null, // last riddle clue-count rendered, so the timer tick only re-renders when a new clue actually appears
-    examBulkOpen:{}         // {examId: true} — whether the bulk-import textarea is open for that exam
+    examBulkOpen:{},        // {examId: true} — whether the bulk-import textarea is open for that exam
+
+    // ---- Exam answer touch guard (prevents a tap meant for one question from
+    // landing on the next question when a timeout re-render happens mid-tap) ----
+    examAnswerTouchAt:0,       // Date.now() of the last touchstart on an answer option, 0 if none pending
+    examAnswerLockUntil:0,     // timestamp until which the *new* question's options are inert after any advance
+    examAnswerLockTimer:null   // pending setTimeout id that clears the lock and re-renders
   };
 
   function syncRoleFlags(){
@@ -2958,15 +2964,19 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     } else {
       html += `<p style="font-weight:600; margin:4px 0 10px;">${escapeHtml(qq.text)}</p>`;
       if(qq.type==='mcq' || qq.type==='true_false'){
+        // Briefly locked right after a question transition (real answer or
+        // timeout) so a touch that started on the *previous* question can't
+        // resolve onto this one's options — see examAnswerLockUntil.
+        const locked = Date.now() < ui.examAnswerLockUntil;
         const order = getShuffledOptionOrder(exam, name, qq);
         order.forEach(oi=>{
           const opt = qq.options[oi];
-          html += `<label style="display:flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid var(--hair); border-radius:7px; margin-bottom:6px; cursor:pointer;">
-            <input type="radio" name="q-current" value="${oi}" data-exam-answer-choice="1">
+          html += `<label style="display:flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid var(--hair); border-radius:7px; margin-bottom:6px; cursor:${locked?'default':'pointer'}; opacity:${locked?'0.45':'1'}; ${locked?'pointer-events:none;':''}">
+            <input type="radio" name="q-current" value="${oi}" data-exam-answer-choice="1" data-exam-answer-touch="1" ${locked?'disabled':''}>
             <span>${escapeHtml(opt)}</span>
           </label>`;
         });
-        html += `<p class="small-note" style="margin-top:4px;">Tap an option to answer — it submits instantly and moves you on.</p>`;
+        html += `<p class="small-note" style="margin-top:4px;" id="exam-answer-hint">${locked?'Next question…':'Tap an option to answer — it submits instantly and moves you on.'}</p>`;
       } else if(qq.type==='short'){
         html += `<input type="text" id="exam-text-input" placeholder="Your answer">
           <button class="btn btn-brass" style="margin-top:8px;" data-exam-answer-submit="1">Submit answer</button>`;
@@ -3389,6 +3399,11 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     qa('[data-exam-answer-submit]').forEach(el=>el.addEventListener('click', submitCurrentAnswer));
     qa('[data-exam-answer-riddle]').forEach(el=>el.addEventListener('click', submitCurrentAnswer));
     qa('[data-exam-answer-choice]').forEach(el=>el.addEventListener('change', submitCurrentAnswer));
+    // Marks a touch as "in flight" the instant a finger lands on an option —
+    // see the trailing-edge grace check in startExamTimer, which uses this to
+    // give a tap that started just before the deadline a moment to resolve
+    // into a real answer instead of being timed out from under it.
+    qa('[data-exam-answer-touch]').forEach(el=>el.addEventListener('touchstart', ()=>{ ui.examAnswerTouchAt = Date.now(); }, {passive:true}));
 
     // Live exams — staff management
     const toggleExamBuilderBtn = q('[data-toggle-exam-builder]');
@@ -4595,20 +4610,23 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
   async function refreshExamResults(examId){
     const ex = (DB.exams||[]).find(e=>e.id===examId);
     if(!ex) return;
-    const rows = [];
     let pendingCount = 0;
-    for(const s of DB.students){
+    // Fetch every student's attempt in parallel rather than one at a time —
+    // with a full roster this turns N sequential round-trips into a single
+    // batch, which is most of why "Refresh" used to feel slow.
+    const rows = await Promise.all(DB.students.map(async s=>{
       const rec = await sGet(`exam_attempt:${examId}:${s.name}`);
       let status = 'Not started', score=null, maxScore=null, pending=false;
       if(rec){
         if(rec.submitted){
           status = rec.timedOutCount ? `Submitted (${rec.timedOutCount} timed out)` : 'Submitted';
           score = rec.score; maxScore = rec.maxScore;
-          if(rec.pending && rec.pending.length){ pending = true; pendingCount += rec.pending.length; }
+          if(rec.pending && rec.pending.length){ pending = true; }
         } else status = `In progress (Q${(rec.currentIndex||0)+1})`;
       }
-      rows.push({ name: s.name, status, score, maxScore, pending });
-    }
+      return { name: s.name, status, score, maxScore, pending, pendingLen: (rec && rec.pending) ? rec.pending.length : 0 };
+    }));
+    pendingCount = rows.reduce((a,r)=>a+r.pendingLen, 0);
     const submitted = rows.filter(r=>r.score!=null);
     const avg = submitted.length>0 ? submitted.reduce((a,r)=>a+(r.maxScore>0?(r.score/r.maxScore)*100:0),0)/submitted.length : null;
     ui.examMonitor = { examId, rows, avg, submittedCount: submitted.length, pendingCount };
@@ -4625,16 +4643,19 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
   async function loadPendingReviewsIntoUi(examId){
     const ex = (DB.exams||[]).find(e=>e.id===examId);
     if(!ex) return;
-    const items = [];
-    for(const s of DB.students){
+    // Parallel reads for the same reason as refreshExamResults above.
+    const perStudent = await Promise.all(DB.students.map(async s=>{
       const rec = await sGet(`exam_attempt:${examId}:${s.name}`);
+      const out = [];
       if(rec && rec.submitted && rec.pending && rec.pending.length){
         rec.pending.forEach(p=>{
           const qq = (ex.questions||[]).find(x=>x.id===p.qid);
-          items.push({ studentName: s.name, qid:p.qid, subject:p.subject, points:p.points, rawAnswer:p.rawAnswer, hint:p.hint, questionText: qq?qq.text:'', acceptedAnswers: qq?qq.acceptedAnswers:null });
+          out.push({ studentName: s.name, qid:p.qid, subject:p.subject, points:p.points, rawAnswer:p.rawAnswer, hint:p.hint, questionText: qq?qq.text:'', acceptedAnswers: qq?qq.acceptedAnswers:null });
         });
       }
-    }
+      return out;
+    }));
+    const items = perStudent.flat();
     ui.examReview = { examId, items };
     render();
   }
@@ -4729,6 +4750,13 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
       const timeLimitMs = questionTimeLimitSec(qq, exam)*1000;
       const remaining = timeLimitMs - elapsed;
       if(remaining<=0){
+        // If a finger is already down on an option (touchstart fired just
+        // before time ran out), give the tap a brief window to resolve into
+        // a real answer instead of nuking the question out from under it.
+        // Genuinely stalled touches (e.g. the finger slid off) still time
+        // out shortly after — this only delays, never prevents, a timeout.
+        const touchInFlight = ui.examAnswerTouchAt && (Date.now()-ui.examAnswerTouchAt) < 400;
+        if(touchInFlight) return;
         timeoutCurrentQuestion(); // async; next tick(s) read the updated state
         return;
       }
@@ -4781,6 +4809,9 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
       await sSet(`exam_attempt:${ex.id}:${name}`, record);
     }
     ui.examLastRevealedCount = null;
+    ui.examAnswerTouchAt = 0;
+    ui.examAnswerLockUntil = 0;
+    if(ui.examAnswerLockTimer){ clearTimeout(ui.examAnswerLockTimer); ui.examAnswerLockTimer = null; }
     ui.examAttempt = { exam: ex, name, record };
 
     if(ex.mode==='reader'){
@@ -4858,7 +4889,31 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
   async function persistExamAttempt(){
     if(!ui.examAttempt) return;
     const {exam, name, record} = ui.examAttempt;
-    await sSet(`exam_attempt:${exam.id}:${name}`, record);
+    // Retry once on a transient network hiccup rather than silently dropping
+    // the student's answer — a flaky wifi blip shouldn't cost them the record
+    // of what they just answered.
+    let ok = await sSet(`exam_attempt:${exam.id}:${name}`, record);
+    if(!ok){
+      await new Promise(r=>setTimeout(r, 600));
+      ok = await sSet(`exam_attempt:${exam.id}:${name}`, record);
+    }
+    if(!ok) toast('Having trouble saving your last answer — check your connection.', 'error');
+  }
+
+  const EXAM_ANSWER_LOCK_MS = 450;
+  // Briefly makes the answer options inert right after a question transition.
+  // Full re-renders replace the option DOM nodes outright, so without this a
+  // touch that started on the previous question can resolve onto the new
+  // one's options mid-gesture and register the wrong answer. See render logic
+  // in renderExamTaking, which checks ui.examAnswerLockUntil.
+  function lockExamAnswerInput(){
+    ui.examAnswerTouchAt = 0;
+    ui.examAnswerLockUntil = Date.now() + EXAM_ANSWER_LOCK_MS;
+    if(ui.examAnswerLockTimer) clearTimeout(ui.examAnswerLockTimer);
+    ui.examAnswerLockTimer = setTimeout(()=>{
+      ui.examAnswerLockTimer = null;
+      if(ui.examAttempt && !ui.examAttempt.record.submitted) render(); // make the new question live without waiting for the next 1s timer tick
+    }, EXAM_ANSWER_LOCK_MS + 20);
   }
 
   async function advanceOrFinalize(){
@@ -4871,6 +4926,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     if(record.currentIndex >= qOrder.length){
       await finalizeExamAttempt();
     } else {
+      lockExamAnswerInput();
       await persistExamAttempt();
       render();
     }
@@ -4958,15 +5014,20 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     const {exam, name, record} = ui.examAttempt;
     if(record.submitted) return;
     finalizeAttemptScore(exam, record);
-    await sSet(`exam_attempt:${exam.id}:${name}`, record);
+    let ok = await sSet(`exam_attempt:${exam.id}:${name}`, record);
+    if(!ok){
+      await new Promise(r=>setTimeout(r, 600));
+      ok = await sSet(`exam_attempt:${exam.id}:${name}`, record);
+    }
     ui.examAttempt = { exam, name, record };
-    toast('Exam submitted.', 'success');
+    toast(ok ? 'Exam submitted.' : 'Submitted, but the save didn\'t confirm — stay on this screen and check your connection.', ok?'success':'error');
     render();
   }
 
   function exitExamAttempt(){
     stopExamTimer();
     stopReaderPoll();
+    if(ui.examAnswerLockTimer){ clearTimeout(ui.examAnswerLockTimer); ui.examAnswerLockTimer = null; }
     ui.examAttempt = null;
     render();
   }
@@ -5083,18 +5144,25 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
 
   /* ============================= INIT ============================= */
   async function init(){
-    const students = await sGet('students');
-    const legacyRoster = await sGet('roster'); // migrate from the old free-text roster
-    const tIndex = await sGet('tournament_index');
-    const accessPins = await sGet('access_pins');
-    const legacyCoachPin = await sGet('coach_pin'); // migrate from the old single-PIN system
-    const meetings = await sGet('meetings');
-    const assessments = await sGet('assessments');
-    const weights = await sGet('selection_weights');
-    const notes = await sGet('student_notes');
-    const exams = await sGet('exams');
-    const auditLog = await sGet('audit_log');
-    const studentPins = await sGet('student_pins');
+    // These 12 reads are independent of each other, so fire them all at once
+    // instead of one-by-one — this was the biggest chunk of first-load time.
+    const [
+      students, legacyRoster, tIndex, accessPins, legacyCoachPin,
+      meetings, assessments, weights, notes, exams, auditLog, studentPins
+    ] = await Promise.all([
+      sGet('students'),
+      sGet('roster'), // migrate from the old free-text roster
+      sGet('tournament_index'),
+      sGet('access_pins'),
+      sGet('coach_pin'), // migrate from the old single-PIN system
+      sGet('meetings'),
+      sGet('assessments'),
+      sGet('selection_weights'),
+      sGet('student_notes'),
+      sGet('exams'),
+      sGet('audit_log'),
+      sGet('student_pins')
+    ]);
     if(students){
       DB.students = students;
     } else if(legacyRoster && legacyRoster.length){
@@ -5119,12 +5187,10 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     } else {
       DB.pins = {coach:null, staff:null, scorer:null};
     }
-    DB.fullCache = [];
-    // preload all tournament blobs for profile aggregation
-    for(const summary of DB.tIndex){
-      const full = await sGet('tournament:'+summary.id);
-      if(full) DB.fullCache.push(full);
-    }
+    // preload all tournament blobs for profile aggregation — fetched in parallel
+    // rather than one at a time, since this ran serially on every page load.
+    const fulls = await Promise.all(DB.tIndex.map(summary=>sGet('tournament:'+summary.id)));
+    DB.fullCache = fulls.filter(Boolean);
     render();
   }
 
