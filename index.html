@@ -2781,7 +2781,7 @@
         answerDisplay = (qq.options && qq.options[idx]!=null) ? qq.options[idx] : res.rawAnswer;
       }
       html += `<div class="card" style="background:var(--panel-2); margin-bottom:8px;">
-        <p class="small-note" style="margin:0 0 4px;">Q${i+1} · ${escapeHtml(qq.subject)} · ${QTYPE_LABELS[qq.type]||qq.type}${res.timedOut?' · timed out':''}</p>
+        <p class="small-note" style="margin:0 0 4px;">Q${i+1} · ${escapeHtml(qq.subject)} · ${QTYPE_LABELS[qq.type]||qq.type}${res.timedOut?' · timed out':''}${res.viaOption?' · answered via options':''}</p>
         <p style="margin:0 0 4px; font-size:13px;">${escapeHtml(qq.type==='riddle'?`Riddle: ${(qq.clues||[])[0]||''}`:qq.text)}</p>
         <p style="margin:0 0 4px;"><strong>Answered:</strong> ${escapeHtml(String(answerDisplay))}</p>
         ${(qq.type==='mcq'||qq.type==='true_false') ? `<p class="small-note" style="margin:0 0 4px;">Correct option: ${escapeHtml(qq.options[qq.correctIndex]||'')}</p>` : ''}
@@ -2801,7 +2801,10 @@
       html += `<p class="small-note" style="margin:0 0 4px;">${escapeHtml(qq.subject)} · ${QTYPE_LABELS[qq.type]||qq.type}</p>`;
       if(qq.type==='riddle'){
         html += `<div style="margin:0 0 8px;">${(qq.clues||[]).map((c,i)=>`<p style="margin:2px 0; font-size:13px;"><strong>Clue ${i+1}:</strong> ${escapeHtml(c)}</p>`).join('')}
-          <p class="small-note">Accepted: ${(qq.acceptedAnswers||[]).map(escapeHtml).join(', ')}</p></div>`;
+          <p class="small-note">Accepted: ${(qq.acceptedAnswers||[]).map(escapeHtml).join(', ')}</p>
+          ${(qq.answerMode==='options' && (qq.options||[]).length>0) ? `<p class="small-note" style="margin-top:4px;">Options (wrong pick costs ${qq.optionWrongPenalty!=null?qq.optionWrongPenalty:1} pt${(qq.optionWrongPenalty!=null?qq.optionWrongPenalty:1)!==1?'s':''}):</p>
+          <ul style="margin:0 0 8px; padding-left:18px;">${qq.options.map(o=>{ const isCorrect=(qq.acceptedAnswers||[]).map(normalizeText).includes(normalizeText(o)); return `<li>${isCorrect?'<strong>':''}${escapeHtml(o)}${isCorrect?' ✓</strong>':''}</li>`; }).join('')}</ul>` : ''}
+        </div>`;
       } else {
         html += `<p style="font-weight:600; margin:0 0 8px;">${escapeHtml(qq.text)}</p>`;
         if(qq.type==='mcq' || qq.type==='true_false'){
@@ -2884,6 +2887,14 @@
       <p class="small-note" style="margin:6px 0 4px;">One clue per line. Clue 1 shows immediately; each next clue appears 5 seconds later. Answering on clue 1 scores 5 pts, clue 2 scores 4, clue 3 or later scores 3.</p>
       <textarea id="f-eq-riddle-clues-${examId}" rows="4" placeholder="I am a unicellular free-living organism.&#10;I belong to the phylum Rhizopoda.&#10;I move using pseudopodia."></textarea>
       <div style="margin-top:6px;"><input type="text" id="f-eq-riddle-accepted-${examId}" placeholder="Accepted answers, separated by | (e.g. amoeba | ameba)"></div>
+      <div class="row" style="margin-top:8px; align-items:center;">
+        <div style="flex:0; display:flex; align-items:center; gap:6px;"><input type="checkbox" id="f-eq-riddle-options-toggle-${examId}" style="width:auto;" data-eq-riddle-options-toggle="${examId}"><label for="f-eq-riddle-options-toggle-${examId}" style="margin:0; font-size:13px;">Also offer clickable options (from clue 3 onward)</label></div>
+      </div>
+      <div id="eq-riddle-options-wrap-${examId}" style="display:none; margin-top:6px;">
+        <p class="small-note" style="margin:0 0 4px;">6–10 plausible answers, one per line — must include exactly one that matches an accepted answer above (spelling/case/spacing don't matter). Options shuffle per student and only appear from clue 3, so answering on clue 1–2 always means typing. Typing stays free of penalty even after options appear; clicking an option is graded like multiple choice.</p>
+        <textarea id="f-eq-riddle-options-${examId}" rows="4" placeholder="Amoeba&#10;Paramecium&#10;Euglena&#10;Plasmodium&#10;Giardia&#10;Trypanosoma"></textarea>
+        <div style="margin-top:6px; max-width:220px;"><label class="field">Penalty if wrong via options</label><input type="number" id="f-eq-riddle-option-penalty-${examId}" min="0" step="0.5" value="1"></div>
+      </div>
     </div>`;
 
     html += `<button class="btn btn-sm" style="margin-top:10px;" data-exam-add-question="${examId}">Add question</button>
@@ -2900,8 +2911,10 @@ TF||Physics||Light travels faster than sound||True||2||N
 SHORT||Biology||Organelle that does photosynthesis?||chloroplast;chloroplasts||3||N
 # NUMERIC||Subject||Question||value||tolerance||units;alt||UnitRequired(Y/N)||Points||Calc(Y/N)
 NUMERIC||Mathematics||Area of a 2m×2.5m rectangle?||5||0||m^2;m2;sqm||Y||3||Y
-# RIDDLE||Subject||clue1;clue2;clue3||accepted;answers
-RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.;I move using pseudopodia.||amoeba;ameba</pre>
+# RIDDLE||Subject||clue1;clue2;clue3||accepted;answers||opt1;opt2;...;opt6-10 (optional)||penalty (optional, default 1)
+RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.;I move using pseudopodia.||amoeba;ameba
+RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.;I move using pseudopodia.||amoeba;ameba||Amoeba;Paramecium;Euglena;Plasmodium;Giardia;Trypanosoma||1</pre>
+        <p class="small-note" style="margin:0 0 8px;">For a RIDDLE, adding the options field turns it into a click-to-answer riddle (from clue 3 onward) — leave it out for a typed-only riddle, exactly as before.</p>
         <textarea id="f-eq-bulk-${examId}" rows="6" placeholder="Paste your lines here…"></textarea>
         <button class="btn btn-sm btn-brass" style="margin-top:8px;" data-exam-add-bulk="${examId}">Add all valid lines</button>
       </div>`;
@@ -2954,13 +2967,32 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
       const clues = qq.clues||[];
       const revealedCount = Math.min(clues.length, Math.floor(elapsed/((exam.riddleClueSeconds||5)*1000))+1);
       const nextCluePts = revealedCount<=1 ? 5 : (revealedCount===2 ? 4 : 3);
+      // Same lock used for MCQ options below — applies here too since riddle
+      // options are click-to-submit the same way.
+      const locked = Date.now() < ui.examAnswerLockUntil;
       html += `<div id="exam-riddle-clues">`;
       for(let c=0;c<revealedCount;c++){
         html += `<p style="margin:4px 0;"><strong>Clue ${c+1}:</strong> ${escapeHtml(clues[c])}</p>`;
       }
       html += `</div>
-        <input type="text" id="exam-riddle-input" placeholder="Who or what am I?">
-        <button class="btn btn-brass" style="margin-top:8px;" data-exam-answer-riddle="1" id="exam-riddle-answer-btn">Answer now — worth <span id="exam-riddle-pts">${nextCluePts}</span> pt${nextCluePts!==1?'s':''} if correct</button>`;
+        <input type="text" id="exam-riddle-input" placeholder="Who or what am I?" ${locked?'disabled':''}>
+        <button class="btn btn-brass" style="margin-top:8px;" data-exam-answer-riddle="1" id="exam-riddle-answer-btn" ${locked?'disabled':''}>Answer now — worth <span id="exam-riddle-pts">${nextCluePts}</span> pt${nextCluePts!==1?'s':''} if correct</button>
+        <p class="small-note" style="margin-top:4px;">Typing an answer is never penalized, right or wrong.</p>`;
+      // Options only ever appear once the flat 3-point tier is reached (clue 3+),
+      // and only for riddles the coach specifically set up with options. Typing
+      // stays available the whole time as a no-penalty alternative.
+      if(qq.answerMode==='options' && (qq.options||[]).length>0 && revealedCount>=3){
+        const order = getShuffledOptionOrder(exam, name, qq);
+        const penalty = qq.optionWrongPenalty!=null ? qq.optionWrongPenalty : 1;
+        html += `<p class="small-note" style="margin-top:12px;">— or choose one — a wrong pick costs ${penalty} pt${penalty!==1?'s':''}:</p>`;
+        order.forEach(oi=>{
+          const opt = qq.options[oi];
+          html += `<label style="display:flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid var(--hair); border-radius:7px; margin-bottom:6px; cursor:${locked?'default':'pointer'}; opacity:${locked?'0.45':'1'}; ${locked?'pointer-events:none;':''}">
+            <input type="radio" name="q-riddle-option" value="${escapeAttr(opt)}" data-exam-riddle-option-choice="1" data-exam-answer-touch="1" ${locked?'disabled':''}>
+            <span>${escapeHtml(opt)}</span>
+          </label>`;
+        });
+      }
     } else {
       html += `<p style="font-weight:600; margin:4px 0 10px;">${escapeHtml(qq.text)}</p>`;
       if(qq.type==='mcq' || qq.type==='true_false'){
@@ -3011,7 +3043,20 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     if(qq.type==='riddle'){
       html += `<div>${(qq.clues||[]).map((c,i)=>`<p style="margin:4px 0;"><strong>Clue ${i+1}:</strong> ${escapeHtml(c)}</p>`).join('')}</div>
         <input type="text" id="exam-text-input" placeholder="Your answer">
-        <button class="btn btn-brass" style="margin-top:8px;" data-exam-answer-submit-reader="1">Submit answer</button>`;
+        <button class="btn btn-brass" style="margin-top:8px;" data-exam-answer-submit-reader="1">Submit answer</button>
+        <p class="small-note" style="margin-top:4px;">Typing an answer is never penalized, right or wrong.</p>`;
+      if(qq.answerMode==='options' && (qq.options||[]).length>0){
+        const order = getShuffledOptionOrder(exam, name, qq);
+        const penalty = qq.optionWrongPenalty!=null ? qq.optionWrongPenalty : 1;
+        html += `<p class="small-note" style="margin-top:12px;">— or choose one — a wrong pick costs ${penalty} pt${penalty!==1?'s':''}:</p>`;
+        order.forEach(oi=>{
+          const opt = qq.options[oi];
+          html += `<label style="display:flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid var(--hair); border-radius:7px; margin-bottom:6px; cursor:pointer;">
+            <input type="radio" name="q-riddle-option" value="${escapeAttr(opt)}" data-exam-riddle-option-choice-reader="1">
+            <span>${escapeHtml(opt)}</span>
+          </label>`;
+        });
+      }
     } else {
       html += `<p style="font-weight:600; margin:4px 0 10px;">${escapeHtml(qq.text)}</p>`;
       if(qq.type==='mcq' || qq.type==='true_false'){
@@ -3399,6 +3444,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     qa('[data-exam-answer-submit]').forEach(el=>el.addEventListener('click', submitCurrentAnswer));
     qa('[data-exam-answer-riddle]').forEach(el=>el.addEventListener('click', submitCurrentAnswer));
     qa('[data-exam-answer-choice]').forEach(el=>el.addEventListener('change', submitCurrentAnswer));
+    qa('[data-exam-riddle-option-choice]').forEach(el=>el.addEventListener('change', submitRiddleOptionAnswer));
     // Marks a touch as "in flight" the instant a finger lands on an option —
     // see the trailing-edge grace check in startExamTimer, which uses this to
     // give a tap that started just before the deadline a moment to resolve
@@ -3434,6 +3480,11 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
       const ptsEl = document.getElementById(`f-eq-points-${examId}`);
       if(ptsEl && !isRiddle) ptsEl.value = (el.value==='mcq'||el.value==='true_false') ? 2 : 3;
     }));
+    qa('[data-eq-riddle-options-toggle]').forEach(el=>el.addEventListener('change', ()=>{
+      const examId = el.getAttribute('data-eq-riddle-options-toggle');
+      const wrap = document.getElementById(`eq-riddle-options-wrap-${examId}`);
+      if(wrap) wrap.style.display = el.checked ? '' : 'none';
+    }));
     qa('[data-toggle-exam]').forEach(el=>el.addEventListener('click', ()=>{
       const id = el.getAttribute('data-toggle-exam');
       ui.expandedExamId = (ui.expandedExamId===id) ? null : id;
@@ -3463,6 +3514,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     }));
     qa('[data-exam-answer-submit-reader]').forEach(el=>el.addEventListener('click', submitReaderAnswer));
     qa('[data-exam-answer-choice-reader]').forEach(el=>el.addEventListener('change', submitReaderAnswer));
+    qa('[data-exam-riddle-option-choice-reader]').forEach(el=>el.addEventListener('change', submitReaderAnswer));
     qa('[data-exam-add-question]').forEach(el=>el.addEventListener('click', ()=>{
       addExamQuestion(el.getAttribute('data-exam-add-question'));
     }));
@@ -3728,19 +3780,41 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
 
   async function openTournament(id){
     stopWatchingTournament();
-    const t = await sGet('tournament:'+id);
-    if(!t){ alert('Could not load this tournament.'); return; }
-    currentTournament = t;
     ui.tId = id;
     ui.view = 'tournament';
     ui.qualifySelection = null;
     ui.qualifySelectionStage = null;
-    ui.viewingStageIdx = t.currentStageIndex;
     ui.lastFixtureError = null;
+    // Paint instantly from whatever we already preloaded at startup — no need
+    // to wait on the network just to show the screen. The subscribe below
+    // (which delivers the current server copy as its very first callback)
+    // will silently replace this with the up-to-date version moments later,
+    // whether or not anything actually changed.
+    const cached = (DB.fullCache||[]).find(x=>x.id===id);
+    currentTournament = cached || null;
+    ui.viewingStageIdx = cached ? cached.currentStageIndex : null;
     render();
-    // live sync: any device's changes to this tournament now appear here automatically
+    let firstValueSeen = false;
+    // live sync: any device's changes to this tournament now appear here automatically.
+    // This single subscription also serves as the initial load — Firebase's onValue
+    // delivers the current value as its first callback, so there's no separate
+    // "get" round-trip before it (that used to mean two network fetches per open).
     tournamentUnsub = window.storage.subscribe('tournament:'+id, (val)=>{
-      if(!val || ui.tId!==id || ui.view!=='tournament') return;
+      if(ui.tId!==id || ui.view!=='tournament') return;
+      if(!firstValueSeen){
+        firstValueSeen = true;
+        if(!val){
+          if(!cached){ ui.view = 'home'; ui.tId = null; render(); alert('Could not load this tournament.'); }
+          return;
+        }
+        currentTournament = val;
+        ui.viewingStageIdx = val.currentStageIndex;
+        const idx = (DB.fullCache||[]).findIndex(x=>x.id===id);
+        if(idx>=0) DB.fullCache[idx] = val; else DB.fullCache.push(val);
+        render();
+        return;
+      }
+      if(!val) return;
       if(pendingLocalSaves>0){
         // this is (most likely) our own write echoing back — data's already current
         // locally, so just absorb it silently instead of re-rendering on top of
@@ -4280,7 +4354,17 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
   // Resolves the outcome of a single question at the moment it's answered (or timed
   // out). Called once per question, immediately — not deferred to the end of the exam —
   // since the exam is now paced one question at a time.
-  function resolveQuestionOutcome(question, rawAnswer, exam, clueIndex){
+  // Shared by the single-question form and bulk import: makes sure an options-mode
+  // riddle actually has a pickable correct answer among its options, and a sane count.
+  function validateRiddleOptions(options, accepted){
+    if(options.length<6 || options.length>10) return {error:'Riddle options need between 6 and 10 lines.'};
+    const acceptedNorm = accepted.map(normalizeText);
+    const hasMatch = options.some(o=>acceptedNorm.includes(normalizeText(o)));
+    if(!hasMatch) return {error:'None of the options match an accepted answer — add the correct answer as one of the option lines.'};
+    return {ok:true};
+  }
+
+  function resolveQuestionOutcome(question, rawAnswer, exam, clueIndex, viaOption){
     const mcqPenalty = exam.negativeMarking ? (exam.negativePenalty!=null?exam.negativePenalty:1) : 0;
     const shortPenalty = exam.shortNegativeMarking ? (exam.shortPenalty!=null?exam.shortPenalty:1) : 0;
     const pts = question.points||1;
@@ -4296,7 +4380,23 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     if(question.type==='numeric') return gradeShortLikeAnswer(question, rawAnswer, true, shortPenalty);
     if(question.type==='riddle'){
       const cluePts = riddleCluePoints(clueIndex||1);
-      return gradeShortLikeAnswer(question, rawAnswer, false, shortPenalty, cluePts, cluePts);
+      if(viaOption){
+        // Clicked one of the options — this only happens once the flat 3-point
+        // tier is reached, so it's an exact match, graded like an MCQ pick:
+        // no ambiguity, no manual review, and a configurable penalty if wrong.
+        if(rawAnswer===undefined || rawAnswer===null || rawAnswer===''){
+          return {status:'unanswered', earned:0};
+        }
+        const norm = normalizeText(rawAnswer);
+        const accepted = (question.acceptedAnswers||[]).map(normalizeText);
+        if(accepted.includes(norm)) return {status:'correct', earned:cluePts};
+        const penalty = question.optionWrongPenalty!=null ? question.optionWrongPenalty : 1;
+        return {status:'incorrect', earned:-penalty};
+      }
+      // Typed riddle answers are never penalized, right or wrong — regardless
+      // of the exam's "short answer/numeric/riddle: penalize wrong" setting,
+      // which now only applies to short/numeric. Only an option click risks points.
+      return gradeShortLikeAnswer(question, rawAnswer, false, 0, cluePts, cluePts);
     }
     return {status:'pending', earned:0, hint:'Unknown question type', penaltyIfWrong:0};
   }
@@ -4466,11 +4566,22 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
         return {question:{ id:uid('q'), subject, type:'numeric', text, correctValue: parseFloat(value), tolerance: parseFloat(tol)||0, units: unitList, unitRequired, points: parseFloat(pts)||3, requiresCalculation: yn(calc) }};
       }
       if(kind==='RIDDLE'){
-        const [, subject, cluesRaw, acceptedRaw] = parts;
+        const [, subject, cluesRaw, acceptedRaw, optionsRaw, penaltyRaw] = parts;
         const clues = (cluesRaw||'').split(';').map(s=>s.trim()).filter(Boolean);
         const accepted = (acceptedRaw||'').split(';').map(s=>s.trim()).filter(Boolean);
         if(!subject||clues.length===0||accepted.length===0) return {error:'RIDDLE needs subject, at least one clue, and accepted answer(s)'};
-        return {question:{ id:uid('q'), subject, type:'riddle', text:`Riddle (${clues.length} clues)`, clues, acceptedAnswers:accepted, points:5, requiresCalculation:false }};
+        const question = { id:uid('q'), subject, type:'riddle', text:`Riddle (${clues.length} clues)`, clues, acceptedAnswers:accepted, points:5, requiresCalculation:false };
+        // Two extra ||-separated fields are optional: a ;-separated options list (6-10)
+        // turns this into an options-mode riddle, and a penalty value after it (default 1).
+        if(optionsRaw && optionsRaw.trim()){
+          const options = optionsRaw.split(';').map(s=>s.trim()).filter(Boolean);
+          const check = validateRiddleOptions(options, accepted);
+          if(check.error) return {error:`RIDDLE options: ${check.error}`};
+          question.answerMode = 'options';
+          question.options = options;
+          question.optionWrongPenalty = penaltyRaw!==undefined && penaltyRaw!=='' ? (parseFloat(penaltyRaw)||0) : 1;
+        }
+        return {question};
       }
       return {error:`Unknown question type "${parts[0]}"`};
     } catch(e){
@@ -4528,6 +4639,18 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
       question.clues = clues;
       question.acceptedAnswers = accepted;
       question.points = 5; // best case (answered on clue 1); actual award is 5/4/3 based on clues revealed
+
+      const optionsToggleEl = q(`#f-eq-riddle-options-toggle-${examId}`);
+      if(optionsToggleEl && optionsToggleEl.checked){
+        const optionsEl = q(`#f-eq-riddle-options-${examId}`);
+        const penaltyEl = q(`#f-eq-riddle-option-penalty-${examId}`);
+        const options = (optionsEl ? optionsEl.value : '').split('\n').map(s=>s.trim()).filter(Boolean);
+        const check = validateRiddleOptions(options, accepted);
+        if(check.error){ toast(check.error, 'error'); return; }
+        question.answerMode = 'options';
+        question.options = options;
+        question.optionWrongPenalty = penaltyEl ? (parseFloat(penaltyEl.value)||0) : 1;
+      }
     } else {
       const text = (textEl ? textEl.value : '').trim();
       if(!text){ toast('Add the question text.', 'error'); return; }
@@ -4765,8 +4888,14 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
       if(qq.type==='riddle'){
         const revealedCount = Math.min((qq.clues||[]).length, Math.floor(elapsed/((exam.riddleClueSeconds||5)*1000))+1);
         if(revealedCount !== ui.examLastRevealedCount){
+          const justUnlockedOptions = qq.answerMode==='options' && (qq.options||[]).length>0
+            && revealedCount>=3 && (ui.examLastRevealedCount||0)<3;
           ui.examLastRevealedCount = revealedCount;
-          revealNextRiddleClueInPlace(qq, revealedCount);
+          if(justUnlockedOptions){
+            render(); // the options list needs to be created — a one-time full render right when it first appears
+          } else {
+            revealNextRiddleClueInPlace(qq, revealedCount);
+          }
         }
       }
     }, 1000);
@@ -4868,20 +4997,27 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     const {exam, name, record} = ui.examAttempt;
     const qq = (exam.questions||[])[exam.readerIndex||0];
     if(!qq) return;
-    let raw;
+    let raw, clueIndex, viaOption = false;
     if(qq.type==='mcq' || qq.type==='true_false'){
       const checked = q('input[name="q-current"]:checked');
       if(!checked){ toast('Pick an option first.', 'error'); return; }
       raw = checked.value;
+    } else if(qq.type==='riddle' && qq.answerMode==='options' && q('input[name="q-riddle-option"]:checked')){
+      // A riddle-option pick grades like MCQ — exact match, at the flat
+      // 3-point tier (the same tier options unlock at in the timed mode).
+      raw = q('input[name="q-riddle-option"]:checked').value;
+      clueIndex = 3;
+      viaOption = true;
     } else {
       const inputEl = q('#exam-text-input');
       raw = inputEl ? inputEl.value : '';
       if(!raw.trim()){ toast('Type your answer first.', 'error'); return; }
+      if(qq.type==='riddle') clueIndex = 1; // typed riddle answers in reader mode keep scoring at the top tier, as before
     }
     if(!record.perQuestionResults) record.perQuestionResults = {};
     if(record.perQuestionResults[qq.id]) return; // already answered — guard double submit
-    const outcome = resolveQuestionOutcome(qq, raw, exam, qq.type==='riddle' ? 1 : undefined);
-    record.perQuestionResults[qq.id] = { ...outcome, rawAnswer: raw||'', timedOut:false };
+    const outcome = resolveQuestionOutcome(qq, raw, exam, clueIndex, viaOption);
+    record.perQuestionResults[qq.id] = { ...outcome, rawAnswer: raw||'', timedOut:false, viaOption };
     await sSet(`exam_attempt:${exam.id}:${name}`, record);
     render();
   }
@@ -4932,7 +5068,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     }
   }
 
-  async function answerCurrentQuestion(rawAnswer, clueIndex, isTimeout){
+  async function answerCurrentQuestion(rawAnswer, clueIndex, isTimeout, viaOption){
     if(!ui.examAttempt) return;
     const {exam, name, record} = ui.examAttempt;
     const qOrder = getShuffledQuestionOrder(exam, name);
@@ -4942,14 +5078,27 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     if(record.perQuestionResults[qid]) return; // guard against double-submit
     const qq = (exam.questions||[]).find(qz=>qz.id===qid);
     if(!qq) return;
-    const outcome = resolveQuestionOutcome(qq, rawAnswer, exam, clueIndex);
-    record.perQuestionResults[qid] = { ...outcome, rawAnswer: rawAnswer||'', timedOut: !!isTimeout };
+    const outcome = resolveQuestionOutcome(qq, rawAnswer, exam, clueIndex, viaOption);
+    record.perQuestionResults[qid] = { ...outcome, rawAnswer: rawAnswer||'', timedOut: !!isTimeout, viaOption: !!viaOption };
     if(isTimeout) record.timedOutCount = (record.timedOutCount||0) + 1;
     await advanceOrFinalize();
   }
 
   async function timeoutCurrentQuestion(){
     await answerCurrentQuestion(undefined, undefined, true);
+  }
+
+  async function submitRiddleOptionAnswer(){
+    if(!ui.examAttempt) return;
+    const {exam, name, record} = ui.examAttempt;
+    const qOrder = getShuffledQuestionOrder(exam, name);
+    const qq = (exam.questions||[]).find(qz=>qz.id===qOrder[record.currentIndex||0]);
+    if(!qq || qq.type!=='riddle') return;
+    const checked = q('input[name="q-riddle-option"]:checked');
+    if(!checked) return;
+    const elapsed = Date.now() - (record.questionStartedAt||Date.now());
+    const revealedCount = Math.min((qq.clues||[]).length, Math.floor(elapsed/((exam.riddleClueSeconds||5)*1000))+1);
+    await answerCurrentQuestion(checked.value, revealedCount, false, true);
   }
 
   async function submitCurrentAnswer(){
@@ -4968,7 +5117,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
       if(!raw.trim()){ toast('Type your answer first.', 'error'); return; }
       const elapsed = Date.now() - (record.questionStartedAt||Date.now());
       const revealedCount = Math.min((qq.clues||[]).length, Math.floor(elapsed/((exam.riddleClueSeconds||5)*1000))+1);
-      await answerCurrentQuestion(raw, revealedCount, false);
+      await answerCurrentQuestion(raw, revealedCount, false, false);
     } else {
       const inputEl = q('#exam-text-input');
       const raw = inputEl ? inputEl.value : '';
@@ -5187,11 +5336,16 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     } else {
       DB.pins = {coach:null, staff:null, scorer:null};
     }
-    // preload all tournament blobs for profile aggregation — fetched in parallel
-    // rather than one at a time, since this ran serially on every page load.
-    const fulls = await Promise.all(DB.tIndex.map(summary=>sGet('tournament:'+summary.id)));
-    DB.fullCache = fulls.filter(Boolean);
-    render();
+    DB.fullCache = [];
+    render(); // paint the home screen now — it only needs tIndex, not every tournament's full data
+    // Preload all tournament blobs for profile aggregation, and to make opening any
+    // tournament instant (see openTournament's cache lookup). This runs in the
+    // background so a long tournament history doesn't hold up the first paint —
+    // it used to block render() until every single one had downloaded.
+    Promise.all(DB.tIndex.map(summary=>sGet('tournament:'+summary.id))).then(fulls=>{
+      DB.fullCache = fulls.filter(Boolean);
+      render();
+    });
   }
 
   init();
