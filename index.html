@@ -647,6 +647,14 @@
     });
   }
 
+  // A grid slot's `turns` map is seeded from the match's original m.slots at creation
+  // time. If a seat gets substituted mid-match, the substitute has no turn entry yet —
+  // this creates one on first use instead of throwing when their score gets recorded.
+  function ensureTurn(slot, cid){
+    if(!slot.turns[cid]) slot.turns[cid] = { mainScore:null, bonusCid:null, bonusResult:null };
+    return slot.turns[cid];
+  }
+
   function initLiveScoring(m){
     // Backfill any missing pieces instead of bailing out entirely — a match whose
     // m.live was created under an older schema (missing a round added later, e.g.
@@ -1276,6 +1284,7 @@
           <button class="btn btn-sm btn-ghost" data-reset-fixture="${stageIdx}">↺ ${anyCompleted?'Reset fixture (clears recorded results)':'Regenerate fixture'}</button>`;
       }
       if(canEdit) html += renderSubstitutePanel(t, stage, stageIdx);
+      if(canEdit) html += renderAddMatchPanel(t, stage, stageIdx);
       html += renderFixtureWarnings(t, stage);
       html += `<div class="divider"></div>
         <div class="flex-between" style="margin-bottom:10px;">
@@ -1359,6 +1368,20 @@
       <div class="row" style="margin-top:8px;">
         <div><input type="text" id="f-sub-add-guest-${stageIdx}" placeholder="Or add a guest school…"></div>
         <div style="flex:0;"><button class="btn btn-sm" data-add-substitute-guest="${stageIdx}">Add guest</button></div>
+      </div>
+    </div>`;
+  }
+
+  function renderAddMatchPanel(t, stage, stageIdx){
+    const opts = stage.competitorIds.map(cid=>`<option value="${cid}">${isGuestCompetitor(t,cid)?'🏫 ':''}${escapeHtml(competitorName(t,cid))}</option>`).join('');
+    return `<div class="card" style="background:var(--panel-2); margin-bottom:14px;">
+      <div class="flex-between"><h3 style="margin:0; font-size:14px;">Add an extra contest</h3></div>
+      <p class="small-note" style="margin:6px 0 10px;">Appends a new match at the end of this fixture — existing matches and their recorded scores are untouched.</p>
+      <div class="row">
+        <div><label class="field">Seat 1</label><select id="f-add-match-seat-${stageIdx}-0">${opts}</select></div>
+        <div><label class="field">Seat 2</label><select id="f-add-match-seat-${stageIdx}-1">${opts}</select></div>
+        <div><label class="field">Seat 3</label><select id="f-add-match-seat-${stageIdx}-2">${opts}</select></div>
+        <div style="flex:0;"><button class="btn btn-sm btn-brass" data-add-extra-match="${stageIdx}">+ Add contest</button></div>
       </div>
     </div>`;
   }
@@ -3210,6 +3233,14 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
       const g = gEl ? (parseInt(gEl.value)||1) : 1;
       await generateFinalFixture(stageIdx, g);
     }));
+    qa('[data-add-extra-match]').forEach(el=>el.addEventListener('click', async ()=>{
+      const stageIdx = parseInt(el.getAttribute('data-add-extra-match'));
+      const cids = [0,1,2].map(i=>{
+        const sel = q(`#f-add-match-seat-${stageIdx}-${i}`);
+        return sel ? sel.value : null;
+      });
+      await addExtraMatch(stageIdx, cids);
+    }));
 
     qa('[data-edit-toggle-seed]').forEach(el=>el.addEventListener('click', ()=>{
       toggleCompetitorSeed(el.getAttribute('data-edit-toggle-seed'));
@@ -3271,7 +3302,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
       const [mi, roundKey, idx, cid, valueStr] = el.getAttribute('data-live-main-score').split('|');
       const value = parseFloat(valueStr);
       const m = currentTournament.stages[currentTournament.currentStageIndex].matches[parseInt(mi)];
-      const turn = m.live[roundKey][parseInt(idx)].turns[cid];
+      const turn = ensureTurn(m.live[roundKey][parseInt(idx)], cid);
       turn.mainScore = value;
       if(value >= ROUND_INFO[roundKey].mainCorrect){ turn.bonusCid=null; turn.bonusResult=null; }
       saveCurrentTournament(); render();
@@ -3279,7 +3310,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     qa('[data-live-bonus-cid]').forEach(el=>el.addEventListener('change', e=>{
       const [mi, roundKey, idx, cid] = el.getAttribute('data-live-bonus-cid').split('|');
       const m = currentTournament.stages[currentTournament.currentStageIndex].matches[parseInt(mi)];
-      const turn = m.live[roundKey][parseInt(idx)].turns[cid];
+      const turn = ensureTurn(m.live[roundKey][parseInt(idx)], cid);
       turn.bonusCid = e.target.value || null;
       turn.bonusResult = null;
       saveCurrentTournament(); render();
@@ -3287,7 +3318,7 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     qa('[data-live-bonus-result]').forEach(el=>el.addEventListener('click', ()=>{
       const [mi, roundKey, idx, cid, result] = el.getAttribute('data-live-bonus-result').split('|');
       const m = currentTournament.stages[currentTournament.currentStageIndex].matches[parseInt(mi)];
-      m.live[roundKey][parseInt(idx)].turns[cid].bonusResult = result;
+      ensureTurn(m.live[roundKey][parseInt(idx)], cid).bonusResult = result;
       saveCurrentTournament(); render();
     }));
 
@@ -5181,6 +5212,17 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     if(ui.examAnswerLockTimer){ clearTimeout(ui.examAnswerLockTimer); ui.examAnswerLockTimer = null; }
     ui.examAttempt = null;
     render();
+  }
+
+  async function addExtraMatch(stageIdx, cids){
+    if(!ui.isStaff){ alert('Staff or coach access is required to add a contest.'); return; }
+    const t = currentTournament;
+    const stage = t.stages[stageIdx];
+    if(new Set(cids).size !== 3){ toast('Pick three different contestants for the new contest.', 'error'); return; }
+    stage.matches.push({id:uid('m'), slots:cids, results:{}, completed:false});
+    saveCurrentTournament();
+    render();
+    toast('Contest added at the end of the fixture.', 'success');
   }
 
   async function generateFixtureForStage(stageIdx, mode){
