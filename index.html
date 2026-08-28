@@ -648,15 +648,17 @@
   }
 
   function initLiveScoring(m){
-    if(m.live) return;
-    m.live = {
-      fundamentals: makeGridSlots(m, ROUND_INFO.fundamentals.count),
-      speedRace: Array.from({length:ROUND_INFO.speedRace.count},(_,i)=>({subject:SUBJECTS[i%4], attempts:[null,null,null]})),
-      potd: { subject:'Biology', scores:{} },
-      trueFalse: makeGridSlots(m, ROUND_INFO.trueFalse.count),
-      riddles: Array.from({length:ROUND_INFO.riddles.count},(_,i)=>({subject:SUBJECTS[i%4], winnerCid:null, clue:null})),
-      skip: { potd:false }
-    };
+    // Backfill any missing pieces instead of bailing out entirely — a match whose
+    // m.live was created under an older schema (missing a round added later, e.g.
+    // after a mid-tournament code update) would otherwise keep that gap forever,
+    // and the round renderers below assume every field exists.
+    if(!m.live) m.live = {};
+    if(!m.live.fundamentals) m.live.fundamentals = makeGridSlots(m, ROUND_INFO.fundamentals.count);
+    if(!m.live.speedRace) m.live.speedRace = Array.from({length:ROUND_INFO.speedRace.count},(_,i)=>({subject:SUBJECTS[i%4], attempts:[null,null,null]}));
+    if(!m.live.potd) m.live.potd = { subject:'Biology', scores:{} };
+    if(!m.live.trueFalse) m.live.trueFalse = makeGridSlots(m, ROUND_INFO.trueFalse.count);
+    if(!m.live.riddles) m.live.riddles = Array.from({length:ROUND_INFO.riddles.count},(_,i)=>({subject:SUBJECTS[i%4], winnerCid:null, clue:null}));
+    if(!m.live.skip) m.live.skip = { potd:false };
   }
 
   // Scores a grid-style round (fundamentals or trueFalse) into totals.
