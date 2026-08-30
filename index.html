@@ -1450,13 +1450,13 @@
     html += `</div>`;
 
     if(isOpen){
-      html += renderLiveScorer(t, m, mi);
+      html += renderLiveScorer(t, stage, m, mi);
     }
     html += `</div>`;
     return html;
   }
 
-  function renderLiveScorer(t, m, mi){
+  function renderLiveScorer(t, stage, m, mi){
     initLiveScoring(m);
     if(!m.substitutions) m.substitutions = [];
     const allCids = buildAllRelevantCids(m);
@@ -1471,6 +1471,7 @@
     html += `</div>`;
 
     html += renderSubstitutionPanel(t, m, mi);
+    html += renderIdentityFixPanel(t, stage, m, mi);
 
     html += renderMainBonusRound(m, mi, 'fundamentals', names, getRoundSlots(m,'fundamentals'));
     html += renderSpeedRaceRound(m, mi, names, getRoundSlots(m,'speedRace'));
@@ -1511,6 +1512,24 @@
     }
     html += `</div>`;
     return html;
+  }
+
+  function renderIdentityFixPanel(t, stage, m, mi){
+    const availableCids = stage.competitorIds.filter(cid=>!m.slots.includes(cid));
+    return `<div class="card" style="background:var(--panel-2); margin-bottom:14px;">
+      <div class="flex-between"><h3 style="margin:0;font-size:14px;">Fix a wrongly selected name</h3></div>
+      <p class="small-note" style="margin:6px 0 10px;">Use this only for a clerical mistake — the wrong person was picked for a seat from the very start of the match. Every score already recorded for them moves over to the corrected name; nothing else changes. For a genuine mid-match swap, use "Substitute a seat" above instead.</p>
+      <div class="row">
+        <div><label class="field">Seat to fix</label><select id="f-fix-seat-${mi}">
+          ${m.slots.map((cid,i)=>`<option value="${i}">Seat ${i+1} — currently ${escapeHtml(competitorName(t,cid))}</option>`).join('')}
+        </select></div>
+        <div><label class="field">Should actually be</label><select id="f-fix-name-${mi}">
+          <option value="">Select the correct person…</option>
+          ${availableCids.map(cid=>`<option value="${cid}">${isGuestCompetitor(t,cid)?'🏫 ':''}${escapeHtml(competitorName(t,cid))}</option>`).join('')}
+        </select></div>
+        <div style="flex:0;"><button class="btn btn-sm btn-brass" data-fix-identity="${mi}">Fix name &amp; move scores</button></div>
+      </div>
+    </div>`;
   }
 
   function cellValueForGrid(slot, cid, info){
@@ -3386,6 +3405,14 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     qa('[data-substitute-seat-guest]').forEach(el=>el.addEventListener('click', ()=>{
       performSubstitution(parseInt(el.getAttribute('data-substitute-seat-guest')), true);
     }));
+    qa('[data-fix-identity]').forEach(el=>el.addEventListener('click', ()=>{
+      const mi = parseInt(el.getAttribute('data-fix-identity'));
+      const seatEl = q(`#f-fix-seat-${mi}`);
+      const nameEl = q(`#f-fix-name-${mi}`);
+      const seatIndex = seatEl ? parseInt(seatEl.value) : 0;
+      const newCid = nameEl ? nameEl.value : '';
+      fixSeatIdentity(mi, seatIndex, newCid);
+    }));
 
     const advanceBtn = q('[data-advance-stage]');
     if(advanceBtn) advanceBtn.addEventListener('click', advanceStage);
@@ -3980,6 +4007,53 @@ RIDDLE||Biology||I am unicellular and free-living.;I belong to phylum Rhizopoda.
     saveCurrentTournament();
     logAudit('Substitution', `${competitorName(t,outCid)} → ${name} in ${t.name||'match'} from ${ROUND_INFO[atRoundKey].label}`);
     toast(`${name} substituted in from ${ROUND_INFO[atRoundKey].label} onward.`, 'success');
+    render();
+  }
+
+  // Corrects a clerical mistake — the wrong person was picked for a seat from the
+  // very start (as opposed to performSubstitution, which is a genuine mid-match
+  // handoff). Renames the old cid to the new one everywhere in this match's data —
+  // slots, results, and every round's recorded scores — so nothing is lost, it just
+  // now belongs to the right person.
+  async function fixSeatIdentity(mi, seatIndex, newCid){
+    if(!ui.isStaff){ alert('Staff or coach access is required.'); return; }
+    const t = currentTournament;
+    const stage = t.stages[t.currentStageIndex];
+    const m = stage.matches[mi];
+    const oldCid = m.slots[seatIndex];
+    if(!newCid){ toast('Select the correct person first.', 'error'); return; }
+    if(newCid===oldCid){ toast('That\'s already who is recorded in this seat.', 'error'); return; }
+    if(m.slots.includes(newCid)){ toast('That person is already in another seat of this match.', 'error'); return; }
+
+    const renameKey = (obj)=>{
+      if(obj && Object.prototype.hasOwnProperty.call(obj, oldCid)){
+        obj[newCid] = obj[oldCid];
+        delete obj[oldCid];
+      }
+    };
+
+    m.slots[seatIndex] = newCid;
+    renameKey(m.results);
+    (m.substitutions||[]).forEach(s=>{
+      if(s.outCid===oldCid) s.outCid=newCid;
+      if(s.inCid===oldCid) s.inCid=newCid;
+    });
+    if(m.live){
+      ['fundamentals','trueFalse'].forEach(rk=>{
+        (m.live[rk]||[]).forEach(slot=>{
+          renameKey(slot.turns);
+          Object.values(slot.turns).forEach(turn=>{ if(turn.bonusCid===oldCid) turn.bonusCid=newCid; });
+        });
+      });
+      (m.live.speedRace||[]).forEach(item=>{
+        (item.attempts||[]).forEach(att=>{ if(att && att.cid===oldCid) att.cid=newCid; });
+      });
+      if(m.live.potd) renameKey(m.live.potd.scores);
+      (m.live.riddles||[]).forEach(item=>{ if(item.winnerCid===oldCid) item.winnerCid=newCid; });
+    }
+    saveCurrentTournament();
+    logAudit('Name correction', `${competitorName(t,oldCid)} → ${competitorName(t,newCid)} in Seat ${seatIndex+1} of ${t.name||'match'} (clerical fix)`);
+    toast('Name corrected — all recorded scores now belong to the right person.', 'success');
     render();
   }
 
